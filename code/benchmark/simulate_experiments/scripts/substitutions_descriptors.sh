@@ -45,18 +45,13 @@ TRAIN_SIZES=(20 50 75 100 200 350 500)
 NUM_TRAIN_SIZES=${#TRAIN_SIZES[@]}
 
 # ------------------------
-# FOUNDATION MODELS
-# (progen2 excluded)
+# FOUNDATION MODEL
 # ------------------------
 FOUNDATIONS=(
     "facebook/esm2_t33_650M_UR50D"
 )
 NUM_FOUNDATIONS=${#FOUNDATIONS[@]}
 
-# ------------------------
-# GRID MATH (4D ARRAY)
-# ------------------------
-# Order: foundation → dataset → seed → train_size
 TASK_ID=$SLURM_ARRAY_TASK_ID
 
 TS_IDX=$((TASK_ID % NUM_TRAIN_SIZES))

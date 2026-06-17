@@ -890,9 +890,10 @@ class ModelOptimization:
 
         sns.set_theme(
             context="notebook",
-            style="white",
-            font="DejaVu Serif",        
+            style="white",   
             rc={
+                "font.family": "sans-serif",
+                "font.sans-serif": ["DejaVu Sans"],
                 "figure.dpi": 300,
                 "axes.linewidth": 1.2,
                 "axes.edgecolor": "#333333",

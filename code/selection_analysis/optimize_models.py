@@ -2,6 +2,7 @@ import os
 import argparse
 import pandas as pd
 from functions.model_optimization import ModelOptimization
+from functions.representations import REPRESENTATIONS, NGRAM_VECTORIZERS
 
 
 def save_results(df, df_all_pred, out_dir):
@@ -32,22 +33,23 @@ def save_results(df, df_all_pred, out_dir):
     """
     dataset = df["Dataset"].iloc[0]
     seed = df["Seed"].iloc[0]
-    foundation = df["Foundation"].iloc[0]
+    tag = df["Representation Tag"].iloc[0]
     train_size = df["Train Size"].iloc[0]
-    folder = os.path.join(out_dir, dataset, f"{foundation}", f"seed_{seed}", f"train_size_{train_size}")
+    folder = os.path.join(out_dir, dataset, f"{tag}", f"seed_{seed}", f"train_size_{train_size}")
     os.makedirs(folder, exist_ok=True)
 
     # Save summary of each run
     input_save_path = os.path.join(folder, f"raw_simulation_summary.csv")
-    df_raw = df.copy()
+    df_raw = df.drop(columns=["Representation Tag"])
     if os.path.exists(input_save_path):
         df_raw.to_csv(input_save_path, mode="a", header=False, index=False)
     else:
         df_raw.to_csv(input_save_path, index=False)
 
-    # Save all predictions
+    # Save all predictions. The header is decided by whether the predictions
+    # file already exists, not the summary file.
     all_pred_save_path = os.path.join(folder, f"simulation_all_predictions.csv")
-    if os.path.exists(input_save_path):
+    if os.path.exists(all_pred_save_path):
         df_all_pred.to_csv(all_pred_save_path, mode="a", header=False, index=False)
     else:
         df_all_pred.to_csv(all_pred_save_path, index=False)
@@ -62,27 +64,40 @@ def run_simulations(
     r_seeds=[42, 43, 44, 45, 46],
     n_trials=100,
     folds=10,
+    representation="esm",
+    morgan_radius=2,
+    morgan_bits=2048,
+    ngram_range=(1, 3),
+    ngram_vectorizer="tfidf",
+    ngram_features=1024,
     levenshtein_split=False
 ):
 
     # Ensure output directory exists
     os.makedirs(out_dir, exist_ok=True)
 
-    for data_path in data_paths: 
+    tag = foundation_model_name.split("/")[-1] if representation == "esm" else representation
+
+    for data_path in data_paths:
         dataset_name = os.path.splitext(os.path.basename(data_path))[0]  # get dataset name from file
-        dataset_results = []
-        all_predictions_list = [] 
 
         for size in train_sizes:
             for seed in r_seeds:
-                print(f"\n=== Running simulation: dataset={dataset_name}, Train Size={size}, seed={seed} ===")
+                print(f"\n=== Running simulation: dataset={dataset_name}, "
+                      f"representation={representation}, Train Size={size}, seed={seed} ===")
 
                 sim = ModelOptimization(
                     data_path=data_path,
                     initial_train_size=size,
                     initial_test_size=test_sizes,
                     random_seed=seed,
-                    model_name=foundation_model_name
+                    representation=representation,
+                    model_name=foundation_model_name,
+                    morgan_radius=morgan_radius,
+                    morgan_bits=morgan_bits,
+                    ngram_range=ngram_range,
+                    ngram_vectorizer=ngram_vectorizer,
+                    ngram_features=ngram_features
                 )
 
                 # Prep data
@@ -98,13 +113,20 @@ def run_simulations(
                     optuna_print=False
                 )
 
+                # Results for this run only, so each run is written once.
+                dataset_results = []
+                all_predictions_list = []
+
                 # Flatten label results and attach metadata
                 for label_idx, df in results_df_per_label.items():
+                    df = df.copy()
                     df["Seed"] = seed
                     df["Label"] = label_idx
                     df["Train Size"] = size
-                    df["Foundation"] = foundation_model_name
+                    df["Foundation"] = foundation_model_name if representation == "esm" else "none"
                     df["Dataset"] = dataset_name
+                    df["Representation"] = representation
+                    df["Representation Tag"] = tag
                     dataset_results.append(df)
 
                 # Flatten predictions for CSV
@@ -114,7 +136,8 @@ def run_simulations(
                             all_predictions_list.append({
                                 "Dataset": dataset_name,
                                 "Label": label_idx,
-                                "Foundation": foundation_model_name,
+                                "Representation": representation,
+                                "Foundation": foundation_model_name if representation == "esm" else "none",
                                 "Model": model_name,
                                 "Train Size": size,
                                 "Seed": seed,
@@ -123,12 +146,9 @@ def run_simulations(
                                 "true_value": item["true_value"]
                             })
 
-            # Combine all results
-            dataset_combined_df = pd.concat(dataset_results, ignore_index=True)
-
-            save_results(df=dataset_combined_df, 
-                        df_all_pred=pd.DataFrame(all_predictions_list), 
-                        out_dir=out_dir)
+                save_results(df=pd.concat(dataset_results, ignore_index=True),
+                             df_all_pred=pd.DataFrame(all_predictions_list),
+                             out_dir=out_dir)
 
 
 if __name__ == "__main__":
@@ -141,6 +161,13 @@ if __name__ == "__main__":
     parser.add_argument("--n_seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46], help="List of random seeds.")
     parser.add_argument("--n_trials", type=int, default=100, help="Number of Optuna trials per model.")
     parser.add_argument("--folds", type=int, default=10, help="Number of outer CV folds.")
+    parser.add_argument("--foundation_model", type=str, default="facebook/esm2_t33_650M_UR50D", help="ESM2 checkpoint. Only used when --representation esm.")
+    parser.add_argument("--representation", type=str, default="esm", choices=list(REPRESENTATIONS), help="Sequence representation to use.")
+    parser.add_argument("--morgan_radius", type=int, default=2)
+    parser.add_argument("--morgan_bits", type=int, default=2048)
+    parser.add_argument("--ngram_range", type=int, nargs=2, default=[1, 3], metavar=("MIN", "MAX"))
+    parser.add_argument("--ngram_vectorizer", type=str, default="tfidf", choices=list(NGRAM_VECTORIZERS))
+    parser.add_argument("--ngram_features", type=int, default=1024)
     parser.add_argument("--levenshtein_split", action="store_true", help="Whether to split data strategically using levenshtein distance to minimize similarity between training data and testing data")
 
     args = parser.parse_args()
@@ -155,5 +182,12 @@ if __name__ == "__main__":
         r_seeds=args.n_seeds,
         n_trials=args.n_trials,
         folds=args.folds,
+        foundation_model_name=args.foundation_model,
+        representation=args.representation,
+        morgan_radius=args.morgan_radius,
+        morgan_bits=args.morgan_bits,
+        ngram_range=tuple(args.ngram_range),
+        ngram_vectorizer=args.ngram_vectorizer,
+        ngram_features=args.ngram_features,
         levenshtein_split=args.levenshtein_split,
     )

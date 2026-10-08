@@ -1,11 +1,23 @@
 """
-Run protein fitness prediction simulations using foundation models
-and optimized downstream machine learning models.
+Run peptide/protein fitness prediction simulations using either a foundation
+model or one of three baseline representations, with an optimized downstream
+regression model.
 
-This script benchmarks the predictive performance of protein sequence
-embeddings (e.g. ESM2) across multiple datasets, training set sizes,
-and random seeds. It supports both regression and classification tasks,
-and optionally includes baseline descriptor-based models.
+This script benchmarks the predictive performance of sequence representations
+across multiple datasets, training set sizes, and random seeds.
+
+Representations
+---------------
+Exactly one representation is benchmarked per run, chosen with
+``--representation``:
+
+    esm       Mean-pooled ESM2 embeddings (the foundation model)
+    physchem  Physicochemical descriptors (modlAMP + composition + HeliQuest)
+    morgan    Morgan (circular) fingerprints of the peptide molecule
+    ngram     TF-IDF weighted character n-grams, fit on training data only
+
+The task is regression throughout; classification is not part of the
+benchmark.
 
 Overview
 --------
@@ -18,28 +30,13 @@ the pipeline performs:
 
 1. Data loading and preprocessing
 2. Train/test split initialization
-3. Embedding extraction using:
-       - a pretrained foundation model (e.g. ESM2), or
-       - baseline descriptors (if enabled)
-4. Hyperparameter optimization of downstream models via Optuna
+3. Representation of the sequences
+4. Hyperparameter optimization of the downstream model via Optuna
 5. Model evaluation using cross-validation and held-out test data
 6. Storage of:
        - per-label performance metrics
        - per-sequence predictions
 7. Incremental saving of results to disk
-
-The script is designed for large-scale benchmarking of representation
-learning approaches for protein fitness landscapes.
-
-Key Features
-------------
-• Supports multiple datasets in a single run
-• Evaluates performance across varying training set sizes
-• Robust evaluation via multiple random seeds
-• Optuna-based hyperparameter optimization
-• Optional baseline (descriptor-based) modeling
-• Optional Levenshtein-based data splitting to reduce sequence similarity leakage
-• Supports both regression and classification tasks
 
 Output Structure
 ----------------
@@ -47,11 +44,15 @@ Results are saved incrementally in the following directory layout:
 
     out_dir/
         dataset_name/
-            foundation_model/
+            representation_tag/
                 seed_<seed>/
                     train_size_<size>/
                         raw_simulation_summary.csv
                         simulation_all_predictions.csv
+
+``representation_tag`` is the sanitized foundation model name for ``esm``
+(e.g. ``esm2_t33_650M_UR50D``) and the baseline name otherwise, so the four
+representations never overwrite each other.
 
 Files:
     raw_simulation_summary.csv
@@ -64,7 +65,19 @@ Files:
 import os
 import argparse
 import pandas as pd
-from functions.model_optimization import ModelOptimization
+from functions.model_optimization import ModelOptimization, REPRESENTATIONS
+
+
+def representation_tag(representation, foundation_model_name):
+    """Directory-safe name identifying the representation of a run.
+
+    For ESM this is the model name without the organization prefix, so
+    different ESM2 sizes stay in separate folders. For the baselines it is
+    simply the baseline name.
+    """
+    if representation == "esm":
+        return foundation_model_name.split("/")[-1]
+    return representation
 
 
 def save_results(df, df_all_pred, out_dir):
@@ -95,25 +108,27 @@ def save_results(df, df_all_pred, out_dir):
     """
     dataset = df["Dataset"].iloc[0]
     seed = df["Seed"].iloc[0]
-    foundation = df["Foundation"].iloc[0]
+    tag = df["Representation Tag"].iloc[0]
     train_size = df["Train Size"].iloc[0]
-    folder = os.path.join(out_dir, dataset, f"{foundation}", f"seed_{seed}", f"train_size_{train_size}")
+    folder = os.path.join(out_dir, dataset, f"{tag}", f"seed_{seed}", f"train_size_{train_size}")
     os.makedirs(folder, exist_ok=True)
 
     # Save summary of each run
-    input_save_path = os.path.join(folder, f"raw_simulation_summary.csv")
-    df_raw = df.copy()
+    input_save_path = os.path.join(folder, "raw_simulation_summary.csv")
+    df_raw = df.drop(columns=["Representation Tag"])
     if os.path.exists(input_save_path):
         df_raw.to_csv(input_save_path, mode="a", header=False, index=False)
     else:
         df_raw.to_csv(input_save_path, index=False)
 
-    # Save all predictions
-    all_pred_save_path = os.path.join(folder, f"simulation_all_predictions.csv")
-    if os.path.exists(input_save_path):
+    # Save all predictions. The header is decided by whether the predictions
+    # file already exists, not the summary file.
+    all_pred_save_path = os.path.join(folder, "simulation_all_predictions.csv")
+    if os.path.exists(all_pred_save_path):
         df_all_pred.to_csv(all_pred_save_path, mode="a", header=False, index=False)
     else:
         df_all_pred.to_csv(all_pred_save_path, index=False)
+
 
 def run_simulations(
     data_paths,
@@ -125,13 +140,15 @@ def run_simulations(
     r_seeds=[42, 43, 44, 45, 46],
     n_trials=100,
     folds=10,
-    baseline=True,
-    levenshtein_split=False,
-    classification=False
+    representation="esm",
+    morgan_radius=2,
+    morgan_bits=2048,
+    ngram_range=(1, 3),
+    levenshtein_split=False
 ):
     """
-    Run full protein fitness prediction simulations across datasets,
-    training sizes, and random seeds.
+    Run full fitness prediction simulations across datasets, training sizes,
+    and random seeds.
 
     Parameters
     ----------
@@ -148,7 +165,7 @@ def run_simulations(
 
     foundation_model_name : str, default="facebook/esm2_t33_650M_UR50D"
         Identifier of the pretrained foundation model used to generate
-        sequence embeddings (e.g. HuggingFace ESM models).
+        sequence embeddings. Only used when ``representation="esm"``.
 
     train_sizes : list[int]
         List of training set sizes to evaluate. Each size defines the number
@@ -169,17 +186,24 @@ def run_simulations(
     folds : int, default=10
         Number of cross-validation folds used during model evaluation.
 
-    baseline : bool, default=True
-        If True, use baseline descriptor-based features instead of
-        foundation model embeddings.
+    representation : str, default="esm"
+        Sequence representation to benchmark. One of "esm", "physchem",
+        "morgan", "ngram".
+
+    morgan_radius : int, default=2
+        Morgan fingerprint radius. Only used when ``representation="morgan"``.
+
+    morgan_bits : int, default=2048
+        Morgan fingerprint length in bits. Only used when
+        ``representation="morgan"``.
+
+    ngram_range : tuple[int, int], default=(1, 3)
+        Character n-gram range. Only used when ``representation="ngram"``.
 
     levenshtein_split : bool, default=False
         If True, split data such that training and test sequences are
         dissimilar based on Levenshtein distance. This reduces information
         leakage from similar sequences.
-
-    classification : bool, default=False
-        If True, treat the prediction task as classification instead of regression.
 
     Returns
     -------
@@ -190,22 +214,28 @@ def run_simulations(
     # Ensure output directory exists
     os.makedirs(out_dir, exist_ok=True)
 
-    for data_path in data_paths: 
+    tag = representation_tag(representation, foundation_model_name)
+
+    for data_path in data_paths:
         dataset_name = os.path.splitext(os.path.basename(data_path))[0]  # get dataset name from file
-        dataset_results = []
-        all_predictions_list = [] 
 
         for size in train_sizes:
             for seed in r_seeds:
-                print(f"\n=== Running simulation: dataset={dataset_name}, Train Size={size}, seed={seed} ===")
+                print(
+                    f"\n=== Running simulation: dataset={dataset_name}, "
+                    f"representation={representation}, Train Size={size}, seed={seed} ==="
+                )
 
                 sim = ModelOptimization(
                     data_path=data_path,
                     initial_train_size=size,
                     initial_test_size=test_sizes,
                     random_seed=seed,
+                    representation=representation,
                     model_name=foundation_model_name,
-                    classification=classification
+                    morgan_radius=morgan_radius,
+                    morgan_bits=morgan_bits,
+                    ngram_range=ngram_range
                 )
 
                 # Prep data
@@ -218,72 +248,85 @@ def run_simulations(
                     random_seed=seed,
                     n_trials=n_trials,
                     folds=folds,
-                    baseline=baseline,
                     optuna_print=False
                 )
 
+                # Results for this (dataset, size, seed) run only, so each run
+                # is written once into its own folder.
+                run_results = []
+                run_predictions = []
+
                 # Flatten label results and attach metadata
                 for label_idx, df in results_df_per_label.items():
+                    df = df.copy()
                     df["Seed"] = seed
                     df["Label"] = label_idx
                     df["Train Size"] = size
-                    df["Foundation"] = foundation_model_name
+                    df["Foundation"] = foundation_model_name if representation == "esm" else "none"
                     df["Dataset"] = dataset_name
-                    df["Baseline"] = str(baseline)
-                    dataset_results.append(df)
+                    df["Representation"] = representation
+                    df["Representation Tag"] = tag
+                    run_results.append(df)
 
                 # Flatten predictions for CSV
                 for label_idx, pred_dict in all_predictions_per_label.items():
                     for model_name, predictions in pred_dict.items():
                         for item in predictions:
-                            all_predictions_list.append({
+                            run_predictions.append({
                                 "Dataset": dataset_name,
                                 "Label": label_idx,
-                                "Baseline": str(baseline),
-                                "Foundation": foundation_model_name,
+                                "Representation": representation,
+                                "Foundation": foundation_model_name if representation == "esm" else "none",
                                 "Model": model_name,
                                 "Train Size": size,
                                 "Seed": seed,
-                                "sequence": item["sequence"],  
+                                "sequence": item["sequence"],
                                 "prediction": item["prediction"],
                                 "true_value": item["true_value"]
                             })
 
-            # Combine all results
-            dataset_combined_df = pd.concat(dataset_results, ignore_index=True)
-
-            save_results(df=dataset_combined_df, 
-                        df_all_pred=pd.DataFrame(all_predictions_list), 
-                        out_dir=out_dir)
+                save_results(
+                    df=pd.concat(run_results, ignore_index=True),
+                    df_all_pred=pd.DataFrame(run_predictions),
+                    out_dir=out_dir
+                )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run ESM protein sequence simulations with multiple seeds and training sizes.")
+    parser = argparse.ArgumentParser(
+        description="Run sequence representation benchmarks with multiple seeds and training sizes."
+    )
     parser.add_argument("data_paths", type=str, help="Path to the input CSV datasets. Seperate paths by ,")
     parser.add_argument("out_dir", type=str, help="Directory to save simulation outputs.")
     parser.add_argument("--target_columns", type=str, nargs="+", default=["score"], help="List of column names of the columns containing targets of interest.")
+    parser.add_argument("--foundation_model", type=str, default="facebook/esm2_t33_650M_UR50D", help="HuggingFace ESM2 model. Only used when --representation esm.")
     parser.add_argument("--train_sizes", type=int, nargs="+", default=[20, 50, 75, 100, 200, 350, 500], help="List of training set sizes.")
     parser.add_argument("--test_sizes", type=int, default=500, help="Number of data points for testing.")
     parser.add_argument("--n_seeds", type=int, nargs="+", default=[42, 43, 44, 45, 46], help="List of random seeds.")
     parser.add_argument("--n_trials", type=int, default=100, help="Number of Optuna trials per model.")
     parser.add_argument("--folds", type=int, default=10, help="Number of outer CV folds.")
-    parser.add_argument("--baseline", action="store_true", help="Whether to use baseline descriptors")
+    parser.add_argument("--representation", type=str, default="esm", choices=list(REPRESENTATIONS), help="Sequence representation to benchmark.")
+    parser.add_argument("--morgan_radius", type=int, default=2, help="Morgan fingerprint radius (--representation morgan).")
+    parser.add_argument("--morgan_bits", type=int, default=2048, help="Morgan fingerprint size in bits (--representation morgan).")
+    parser.add_argument("--ngram_range", type=int, nargs=2, default=[1, 3], metavar=("MIN", "MAX"), help="Character n-gram range (--representation ngram).")
     parser.add_argument("--levenshtein_split", action="store_true", help="Whether to split data strategically using levenshtein distance to minimize similarity between training data and testing data")
-    parser.add_argument("--classification", action="store_true", help="Whether to treat the problem as a classification problem.")
 
     args = parser.parse_args()
-    data_paths_ = args.data_paths.split(",") 
+    data_paths_ = args.data_paths.split(",")
 
     run_simulations(
         data_paths=data_paths_,
         out_dir=args.out_dir,
         target_columns=args.target_columns,
+        foundation_model_name=args.foundation_model,
         train_sizes=args.train_sizes,
         test_sizes=args.test_sizes,
         r_seeds=args.n_seeds,
         n_trials=args.n_trials,
         folds=args.folds,
-        baseline=args.baseline,
-        levenshtein_split=args.levenshtein_split,
-        classification=args.classification
+        representation=args.representation,
+        morgan_radius=args.morgan_radius,
+        morgan_bits=args.morgan_bits,
+        ngram_range=tuple(args.ngram_range),
+        levenshtein_split=args.levenshtein_split
     )

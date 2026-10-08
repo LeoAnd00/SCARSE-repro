@@ -1,33 +1,198 @@
+"""
+Active-learning workflow simulation.
+
+At each round a Gaussian process is tuned on the sequences acquired so far,
+used to score the remaining pool, and the top-predicted sequences are acquired.
+The simulation records how good the acquired set is relative to random
+selection.
+
+One sequence representation is used per run: the ESM2 foundation model, or one
+of the three baselines (physicochemical descriptors, Morgan fingerprints,
+character n-grams). See ``representations.py``.
+
+Regression only; classification is not part of the benchmark.
+"""
+
 import os
 import random
+import string
 import warnings
-import numpy as np
-from modlamp.descriptors import GlobalDescriptor
-import pandas as pd
-import torch
-import optuna
 import math
-from sklearn.metrics import mean_squared_error, log_loss
-from sklearn.model_selection import KFold
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import optuna
+import scipy.optimize
+import matplotlib.pyplot as plt
+import seaborn as sns
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Patch
+from sklearn.base import clone
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.gaussian_process.kernels import (
     RBF,
     Matern,
     RationalQuadratic,
     DotProduct
 )
-import string
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.base import clone
-from sklearn.exceptions import ConvergenceWarning
-from sklearn.base import clone
-from transformers import AutoTokenizer, EsmModel
-import matplotlib.pyplot as plt
-import seaborn as sns
-from matplotlib.gridspec import GridSpec
-from pathlib import Path
-from matplotlib.patches import Patch
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
+
+from functions.representations import SequenceRepresenter, REPRESENTATIONS
+
+
+#: Display labels for each representation, used by the figures.
+REPRESENTATION_LABELS = {
+    "esm":      "GPR + ESM2",
+    "physchem": "GPR + Physchem",
+    "morgan":   "GPR + Morgan",
+    "ngram":    "GPR + N-gram",
+}
+
+#: Candidate selection strategies.
+#:   greedy - acquire the `new_samp_per_step` highest-predicted sequences
+#:   mixed  - acquire (1 - explore_frac) of the batch from the highest-predicted
+#:            and explore_frac from the *lowest*-predicted, which deliberately
+#:            spends part of the budget on the model's least favourite region
+ACQUISITION_STRATEGIES = ("greedy", "mixed")
+
+#: Line style per strategy, so a figure can show colour = representation and
+#: style = strategy.
+ACQUISITION_LINESTYLES = {"greedy": "-", "mixed": "--"}
+
+
+def acquisition_label(strategy, explore_frac):
+    """Human-readable strategy name, derived so it follows explore_frac."""
+    if strategy == "greedy":
+        return "Greedy (top-k)"
+    pct = int(round(explore_frac * 100))
+    return f"Mixed ({100 - pct}% best / {pct}% worst)"
+
+
+# ----------------------------------------------------------------------
+# Run-time limits for the GPR hyperparameter search
+# ----------------------------------------------------------------------
+# A single GPR fit can occasionally get stuck in its kernel-hyperparameter
+# optimisation. Two limits keep that from stalling a whole simulation:
+#
+#   trial_timeout - wall-clock seconds one Optuna trial (all CV folds) may take.
+#                   Checked inside the optimiser, so it also interrupts a single
+#                   fit that is stuck. The trial is then discarded (pruned).
+#   round_timeout - wall-clock seconds the Optuna study of one acquisition
+#                   round may take. When reached, no new trials start and the
+#                   best trial so far is used.
+#
+# Neither limit changes a result unless it is actually reached: the optimiser
+# below makes exactly the call sklearn's default "fmin_l_bfgs_b" makes. Every
+# time a limit is reached it is printed, so it can be reported.
+
+#: Deadline (time.monotonic()) for the trial currently being evaluated, or None.
+#: Module level on purpose: sklearn's clone() deep-copies estimator parameters,
+#: so a deadline stored on the optimiser object would not reach the clones.
+_FIT_DEADLINE = None
+
+
+class TrialTimeLimitExceeded(Exception):
+    """Raised inside a GPR fit when the current Optuna trial runs out of time."""
+
+
+def _time_limited_lbfgs(obj_func, initial_theta, bounds):
+    """sklearn's default GPR optimiser (L-BFGS-B), plus the trial deadline."""
+
+    def wrapped(theta, *args, **kwargs):
+        if _FIT_DEADLINE is not None and time.monotonic() > _FIT_DEADLINE:
+            raise TrialTimeLimitExceeded()
+        return obj_func(theta, *args, **kwargs)
+
+    res = scipy.optimize.minimize(wrapped, initial_theta, method="L-BFGS-B",
+                                  jac=True, bounds=bounds)
+    return res.x, res.fun
+
+
+#: Used when every trial of a round was pruned or timed out, so the round can
+#: still make predictions. sklearn's defaults, with the RBF kernel.
+FALLBACK_GPR_PARAMS = {"alpha": 1e-10, "normalize_y": False, "kernel": RBF()}
+
+
+#: Columns of the results table, and the columns that identify one recorded
+#: measurement. The identity columns are used to drop duplicates when a task
+#: has been re-run.
+RESULT_COLUMNS = ["Dataset", "Seed", "Num_samples", "Metric", "Value",
+                  "Representation", "Acquisition"]
+RESULT_ID_COLUMNS = ["Dataset", "Seed", "Num_samples", "Metric",
+                     "Representation", "Acquisition"]
+
+#: Sub-folder of the results directory holding one CSV per array task.
+RUNS_SUBDIR = "runs"
+
+
+def run_file_name(dataset, representation, acquisition, seed):
+    """File name for one (dataset, representation, strategy, seed) run."""
+    safe = lambda v: "".join(c if c.isalnum() or c in "-." else "_" for c in str(v))
+    return (f"{safe(representation)}__{safe(acquisition)}__{safe(dataset)}"
+            f"__seed{safe(seed)}.csv")
+
+
+def load_results(results_dir="./simulation_results", results_csv=None):
+    """Every result row, from the per-run files and any legacy df_all.csv.
+
+    Each array task writes its own file (see RUNS_SUBDIR), because several
+    hundred tasks appending to one shared CSV can interleave and leave torn
+    lines. Rows that are not readable as a complete record are dropped and
+    reported rather than silently plotted.
+    """
+    frames = []
+
+    legacy = Path(results_csv) if results_csv else Path(results_dir) / "df_all.csv"
+    if legacy.exists():
+        frames.append(pd.read_csv(legacy, sep=None, engine="python"))
+
+    run_dir = Path(results_dir) / RUNS_SUBDIR
+    for path in sorted(run_dir.glob("*.csv")):
+        frames.append(pd.read_csv(path))
+
+    if not frames:
+        raise FileNotFoundError(
+            f"No results found: neither {legacy} nor any file in {run_dir}."
+        )
+
+    df = pd.concat(frames, ignore_index=True)
+    if "Acquisition" not in df.columns:      # written before the mixed strategy
+        df["Acquisition"] = "greedy"
+    df["Acquisition"] = df["Acquisition"].fillna("greedy")
+
+    # A torn line leaves fields empty or shifted. Such rows are unusable.
+    ok = (df["Representation"].isin(REPRESENTATION_LABELS)
+          & df["Acquisition"].isin(ACQUISITION_STRATEGIES)
+          & pd.to_numeric(df["Value"], errors="coerce").notna()
+          & pd.to_numeric(df["Num_samples"], errors="coerce").notna())
+    if (~ok).any():
+        print(f"Dropped {int((~ok).sum())} damaged row(s) of {len(df)}; these come "
+              "from tasks that appended to df_all.csv at the same moment.")
+        df = df[ok]
+
+    df["Value"] = pd.to_numeric(df["Value"])
+    df["Num_samples"] = pd.to_numeric(df["Num_samples"])
+
+    # A re-run task replaces its earlier rows: per-run files are read last.
+    before = len(df)
+    df = df.drop_duplicates(subset=RESULT_ID_COLUMNS, keep="last").reset_index(drop=True)
+    if len(df) < before:
+        print(f"Dropped {before - len(df)} duplicate row(s) from re-run tasks.")
+    return df
+
+
+#: Colors matching the rest of the analysis code.
+REPRESENTATION_COLORS = {
+    "GPR + ESM2":     "#4C72B0",
+    "GPR + Physchem": "#DD8452",
+    "GPR + Morgan":   "#55A868",
+    "GPR + N-gram":   "#C44E52",
+}
 
 
 class ModelOptimization:
@@ -38,16 +203,46 @@ class ModelOptimization:
         random_seed=42,
         initial_train_size=20,
         emb_batch_size=64,
-        model_name="facebook/esm2_t33_650M_UR50D"):
+        representation="esm",
+        model_name="facebook/esm2_t33_650M_UR50D",
+        morgan_radius=2,
+        morgan_bits=2048,
+        ngram_range=(1, 3),
+        ngram_vectorizer="tfidf",
+        ngram_features=1024,
+        direction="maximize",
+    ):
+
+        if direction not in ("maximize", "minimize"):
+            raise ValueError(
+                f"direction must be 'maximize' or 'minimize', got {direction!r}"
+            )
+
+        if representation not in REPRESENTATIONS:
+            raise ValueError(
+                f"representation must be one of {REPRESENTATIONS}, got {representation!r}"
+            )
 
         # Parameters
         self.data_path = data_path
         self.random_seed = random_seed
         self.initial_train_size = initial_train_size
         self.emb_batch_size = emb_batch_size
+        self.representation = representation
         self.model_name = model_name
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = None
+        self.direction = direction
+
+        self.representer = SequenceRepresenter(
+            representation=representation,
+            model_name=model_name,
+            emb_batch_size=emb_batch_size,
+            random_seed=random_seed,
+            morgan_radius=morgan_radius,
+            morgan_bits=morgan_bits,
+            ngram_range=ngram_range,
+            ngram_vectorizer=ngram_vectorizer,
+            ngram_features=ngram_features,
+        )
 
         self.df = None
         self.seq_to_score = {}
@@ -57,139 +252,63 @@ class ModelOptimization:
         # Seed
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
-        torch.manual_seed(self.random_seed)
 
+    # ------------------------------------------------------------------
     def prep_data(self, seq_col="sequence", score_col=["score"]):
 
         df = pd.read_csv(self.data_path, sep=None, engine='python')
         required_cols = set([seq_col] + score_col)
         if not required_cols.issubset(df.columns):
-            raise ValueError(f"Input file must contain columns: {required_cols}. Found: {df.columns.tolist()}")
-        
+            raise ValueError(
+                f"Input file must contain columns: {required_cols}. Found: {df.columns.tolist()}"
+            )
+
         # Store column names of the scores
         self.target_names = score_col
 
         # Convert sequence to string
         df["sequence"] = df[seq_col].astype(str)
 
-        # Convert scores to float
-        if not self.classification:
+        # Convert scores to float (regression only)
+        for col in score_col:
+            df[col] = df[col].astype(float)
+
+        # Orient the target so that "higher is better".
+        # The whole workflow selects the largest scores (argsort(...)[-k:]) and
+        # defines the "true top 10%" the same way. For a minimize target (e.g.
+        # -log(HC50) for haemolysis, where a lower value is more desirable) we
+        # negate the score once here. Every downstream top-k selection, the true
+        # top-10% set, and all normalised means then work unchanged and select the
+        # LOWEST original scores. The reported "Top 10% peptides selected (%)"
+        # metric carries no raw score, so it stays in interpretable units.
+        if self.direction == "minimize":
             for col in score_col:
-                df[col] = df[col].astype(float)
-        else:
-            self.label_enc = {}
-            self.positive_label_freq = {}
-            for col in score_col:
-                positive_candidates = ["CPP", "Non-toxic"]
-                column_values = df[col].astype(str)
-
-                # Detect positive class
-                positive_class = None
-                for cls in positive_candidates:
-                    if cls in column_values.values:
-                        positive_class = cls
-                        break
-
-                if positive_class is None:
-                    raise ValueError(
-                        f"No positive class found in column '{col}'. "
-                        f"Expected one of {positive_candidates}"
-                    )
-
-                positive_count = (column_values == positive_class).sum()
-                total_count = len(column_values)
-                positive_ratio = positive_count / total_count
-                self.positive_label_freq[col] = positive_ratio
-                    
-                le = LabelEncoder()
-                df[col] = le.fit_transform(df[col].astype(str))
-                self.label_enc[col] = le
+                df[col] = -df[col]
 
         # Keep only sequence + score columns
         df = df[["sequence"] + score_col].copy()
 
         self.df = df
 
-        self.y_all = df[score_col[0]]
+        # Positional numpy array, so the argsort-based indexing below is
+        # positional rather than label-based.
+        self.y_all = df[score_col[0]].to_numpy()
 
-        # Create a mapping from sequence → list of scores if multiple columns
+        # Create a mapping from sequence -> score, or list of scores
         if len(score_col) == 1:
-            self.seq_to_score = dict(zip(df[seq_col], df[score_col[0]]))
+            self.seq_to_score = dict(zip(df["sequence"], df[score_col[0]]))
         else:
-            self.seq_to_score = dict(zip(df[seq_col], df[score_col].values.tolist()))
+            self.seq_to_score = dict(zip(df["sequence"], df[score_col].values.tolist()))
 
         print("Finished preparing data!")
 
-    def load_model(self, model_name="ESM"):
+    def load_model(self):
+        """Load the foundation model, if the representation needs one."""
+        self.representer.load_model()
 
-        self.model_str_name = model_name.lower() 
-        if model_name.lower() == "esm":
-            print(f"Loading base pretrained ESM model: {self.model_name}")
-            model_source = self.model_name
-
-            self.tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=False)
-            self.model = EsmModel.from_pretrained(model_source)
-
-            self.model = self.model.to(self.device)
-            self.model.eval()
-
-            print("ESM model loaded. Using device:", self.device)
-
-
-    def compute_embeddings(self, 
-                           sequences, 
-                           baseline=False, 
-                           batch_size=None):
-        if batch_size is None:
-            batch_size = self.emb_batch_size
-
-        foundation_embeddings = []
-        X_physchem = []
-        n = len(sequences)
-
-        for i in range(0, n, batch_size):
-            batch = sequences[i:i+batch_size]
-            labels, seqs = zip(*batch)
-
-            if not baseline:
-
-                if self.model_str_name == "esm":
-                    encoded = self.tokenizer(
-                        list(seqs),
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=1024  
-                    ).to(self.device)
-
-                    input_ids = encoded["input_ids"]
-                    attention_mask = encoded["attention_mask"]
-
-                    with torch.no_grad():
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                        hidden_states = outputs.hidden_states
-
-                    last_layer = hidden_states[-1:] 
-                    stacked = torch.stack(last_layer, dim=0) 
-                    mean_layers = stacked.mean(dim=0)
-
-                    for j, seq in enumerate(seqs):
-                        mask = attention_mask[j].bool().to(mean_layers.device)
-                        seq_emb = mean_layers[j, mask].mean(dim=0)
-                        foundation_embeddings.append(seq_emb.cpu().numpy())
-
-            else:
-                for j, seq in enumerate(seqs):
-                    feats = self.compute_generalizable_features(seq)
-                    X_physchem.append(feats.flatten())
-
-        if baseline:
-            all_embeddings = np.array(pd.DataFrame(X_physchem))
-        else:
-            all_embeddings = np.vstack(foundation_embeddings)
-
-        return all_embeddings
-
+    def compute_embeddings(self, sequences, fit=False, batch_size=None):
+        """Represent sequences. ``fit`` is only meaningful for TF-IDF n-grams."""
+        return self.representer.transform(sequences, fit=fit, batch_size=batch_size)
 
     def initialize_training_set(self):
 
@@ -199,212 +318,22 @@ class ModelOptimization:
         self.test_df = self.df.drop(initial_training_df.index).reset_index(drop=True).copy()
         self.test_sequences = self.test_df["sequence"].tolist()
 
-    def compute_generalizable_features(self, seq):
-        
-        # Global features
-        global_desc = GlobalDescriptor([seq])
-        global_desc.calculate_all()
-        global_feats = global_desc.descriptor
+    # ------------------------------------------------------------------
+    def optimize_all_models(self, folds=10, random_seed=42, n_trials=100, optuna_print=True,
+                            trial_timeout=None, round_timeout=None):
+        """Tune the downstream model on the sequences acquired so far.
 
-        # Amino acid composition
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY' 
-        seq_len = len(seq)
-        aa_counts = [seq.count(aa)/seq_len if seq_len > 0 else 0 for aa in amino_acids]
-
-        # Additional features inspired by HeliQuest
-        additional_features = self.additional_features_fun(seq)
-
-
-        combined_feats = np.concatenate([global_feats.flatten(), np.array(aa_counts), np.array(additional_features)]).reshape(1, -1)
-
-        return combined_feats
-    
-    def additional_features_fun(self, seq):
+        trial_timeout / round_timeout are wall-clock limits in seconds (None =
+        no limit); see the note on run-time limits at the top of this module.
         """
-        Function for calculating amino acid type composition, hydrophobic moment and discrimation factor, similar to HeliQuest:
-        Gautier R., Douguet D., Antonny B. and Drin G. HELIQUEST: a web server to screen sequences with specific α-helical properties. Bioinformatics. 2008 Sep 15;24(18):2101-2.
-
-        Parameters
-        ----------
-        seq : str
-        Amino acid sequence.
-
-        Returns
-        -------
-        np.ndarray
-        Feature array of shape (1, n_features).
-        """
-        def assign_hydrophobicity(sequence, scale='Fauchere-Pliska'):  
-            """
-            Assigns a hydrophobicity value to each amino acid in the sequence
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            scales = {'Fauchere-Pliska': {'A':  0.31, 'R': -1.01, 'N': -0.60,
-                                'D': -0.77, 'C':  1.54, 'Q': -0.22,
-                                'E': -0.64, 'G':  0.00, 'H':  0.13,
-                                'I':  1.80, 'L':  1.70, 'K': -0.99,
-                                'M':  1.23, 'F':  1.79, 'P':  0.72,
-                                'S': -0.04, 'T':  0.26, 'W':  2.25,
-                                'Y':  0.96, 'V':  1.22},
-
-            'Eisenberg': {'A':  0.25, 'R': -1.80, 'N': -0.64,
-                        'D': -0.72, 'C':  0.04, 'Q': -0.69,
-                        'E': -0.62, 'G':  0.16, 'H': -0.40,
-                        'I':  0.73, 'L':  0.53, 'K': -1.10,
-                        'M':  0.26, 'F':  0.61, 'P': -0.07,
-                        'S': -0.26, 'T': -0.18, 'W':  0.37,
-                        'Y':  0.02, 'V':  0.54},
-            }
-
-            hscale = scales.get(scale, None)
-            if not hscale:
-                raise KeyError('{} is not a supported scale. '.format(scale))
-
-            hvalues = []
-            for aa in sequence:
-                sc_hydrophobicity = hscale.get(aa, None)
-                if sc_hydrophobicity is None:
-                    raise KeyError('Amino acid not defined in scale: {}'.format(aa))
-                hvalues.append(sc_hydrophobicity)
-
-            return hvalues
-
-        def calculate_moment(array, angle=100):
-            """Calculates the hydrophobic dipole moment from an array of hydrophobicity
-            values. Formula defined by Eisenberg, 1982 (Nature). Returns the average
-            moment (normalized by sequence length)
-
-            uH = sqrt(sum(Hi cos(i*d))**2 + sum(Hi sin(i*d))**2),
-            where i is the amino acid index and d (delta) is an angular value in
-            degrees (100 for alpha-helix, 180 for beta-sheet).
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            sum_cos, sum_sin = 0.0, 0.0
-            for i, hv in enumerate(array):
-                rad_inc = ((i*angle)*math.pi)/180.0
-                sum_cos += hv * math.cos(rad_inc)
-                sum_sin += hv * math.sin(rad_inc)
-            return math.sqrt(sum_cos**2 + sum_sin**2) / len(array)
-
-
-        def calculate_charge(sequence):
-            """
-            Calculates the charge of the peptide sequence at pH 7.4
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-            charge_dict = {'E': -1, 'D': -1, 'K': 1, 'R': 1}
-            sc_charges = [charge_dict.get(aa, 0) for aa in sequence]
-            return sum(sc_charges)
-
-
-        def calculate_discrimination(mean_uH, total_charge):
-            """
-            Returns a discrimination factor according to Rob Keller (IJMS, 2011)
-            A sequence with d>0.68 can be considered a potential lipid-binding region.
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-            d = 0.944*mean_uH + 0.33*total_charge
-            return d
-
-
-        def calculate_composition(sequence):
-            """
-            Returns a dictionary with percentages per classes
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            # Residue character table
-            polar_aa = set(('S', 'T', 'N', 'H', 'Q', 'G'))
-            speci_aa = set(('P', 'C'))
-            apolar_aa = set(('A', 'L', 'V', 'I', 'M'))
-            charged_aa = set(('E', 'D', 'K', 'R'))
-            aromatic_aa = set(('W', 'Y', 'F'))
-
-            n_p, n_s, n_a, n_ar, n_c = 0, 0, 0, 0, 0
-            tot = 0
-            for aa in sequence:
-                tot += 1
-                if aa in polar_aa:
-                    n_p += 1
-                elif aa in speci_aa:
-                    n_s += 1
-                elif aa in apolar_aa:
-                    n_a += 1
-                elif aa in charged_aa:
-                    n_c += 1
-                elif aa in aromatic_aa:
-                    n_ar += 1
-
-            comp_dict = {'polar': n_p, 'special': n_s,
-                        'apolar': n_a, 'charged': n_c, 'aromatic': n_ar}
-            n_tot_pol = comp_dict['polar'] + comp_dict['charged']
-            n_tot_apol = comp_dict['apolar'] + comp_dict['aromatic'] + comp_dict['special'] 
-            n_charged = comp_dict['charged']  
-            n_aromatic = comp_dict['aromatic']  
-
-            return torch.cat([
-                    torch.tensor([n_tot_pol/tot]), # polar
-                    torch.tensor([n_tot_apol/tot]), # apolar          
-                    torch.tensor([n_charged/tot]), # charged
-                    torch.tensor([n_aromatic/tot]) # aromatic
-                ])
-        
-        # HeliQuest inspired features
-        z = calculate_charge(seq)
-        seq_h = assign_hydrophobicity(seq)
-        av_uH = calculate_moment(seq_h)
-        d = calculate_discrimination(av_uH, z)
-        aa_type_comp = calculate_composition(seq)
-
-        additional_features = torch.cat([
-            torch.tensor([av_uH]),
-            torch.tensor([d]),
-            aa_type_comp 
-        ])
-        return additional_features
-
-
-    def optimize_all_models(self, 
-                            folds=10, 
-                            random_seed=42, 
-                            n_trials=100, 
-                            baseline=False, 
-                            optuna_print=True):
 
         # Suppress convergence and feature name warnings
         warnings.filterwarnings('ignore', category=ConvergenceWarning)
         warnings.filterwarnings('ignore', category=UserWarning)
-        
 
         ## Seed
         random.seed(random_seed)
         np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
-
-        label_seq = [(f"train_{i}", seq) for i, seq in enumerate(self.training_sequences)]
-        X_train_temp = self.compute_embeddings(sequences=label_seq, baseline=baseline)
 
         y_train = []
         for s in self.training_sequences:
@@ -422,13 +351,10 @@ class ModelOptimization:
 
         n_targets = y_train.shape[1]
         self.n_targets = n_targets
-        n_samples = X_train_temp.shape[0]
+        n_samples = len(self.training_sequences)
         folds = min(folds, n_samples)
         self.folds = folds
         cv = KFold(n_splits=folds, shuffle=True, random_state=random_seed)
-
-        # Split data
-        self.baseline = baseline
 
         seq_array = np.array(self.training_sequences)
 
@@ -440,11 +366,11 @@ class ModelOptimization:
                 train_df_temp = seq_array[train_idx]
                 val_df_temp = seq_array[valid_idx]
 
-                label_seq_train = [(f"train_{i}", seq) for i, seq in enumerate(train_df_temp)]
-                X_train_fold = self.compute_embeddings(sequences=label_seq_train, baseline=baseline)
-
-                label_seq_val = [(f"val_{i}", seq) for i, seq in enumerate(val_df_temp)]
-                X_val_fold = self.compute_embeddings(sequences=label_seq_val, baseline=baseline)
+                # Represent the fold's training sequences first, with fit=True,
+                # so an n-gram vocabulary is learned from the fold's training
+                # data only and the validation fold is transformed with it.
+                X_train_fold = self.compute_embeddings(list(train_df_temp), fit=True)
+                X_val_fold = self.compute_embeddings(list(val_df_temp), fit=False)
 
                 scaler = StandardScaler()
                 X_train_fold = scaler.fit_transform(X_train_fold)
@@ -459,56 +385,50 @@ class ModelOptimization:
                     'sequence': X_val_fold,
                     'score': y_train[valid_idx, label_idx]
                 }
-                
+
                 dataset_dict = {
                     'train': train_df,
                     'validation': val_df
                 }
-                
+
                 # Store DatasetDict for each fold
                 folds_list.append(dataset_dict)
 
             folds_per_label[f"label_{label_idx}"] = folds_list
-        
-        if not self.classification:
-            model_configs = {
-                #"Ridge": {"class": Ridge, "params": {"alpha": ("float_log", 1e-6, 1e6)}}
-                "GaussianProcessRegressor": {"class": GaussianProcessRegressor, "params": {
-                    "alpha": ("float", 1e-10, 1e-6),
-                    "normalize_y": ("categorical", [True, False]),
-                    "kernel": ("categorical", [
-                        RBF(),
-                        Matern(),
-                        RationalQuadratic(),
-                        DotProduct()])
-                }}
-            }
-        else:
-            model_configs = {
-                "ExtraTrees": {
-                    "class": ExtraTreesClassifier,
-                    "params": {
-                        "n_estimators": ("int", 50, 300),
-                        "max_depth": ("int", 2, 15),
-                        "min_samples_split": ("int", 2, 10),
-                        "min_samples_leaf": ("int", 1, 8),
-                        "max_features": ("categorical", ["sqrt", "log2", None])
-                }}
-            }
+
+        model_configs = {
+            "GaussianProcessRegressor": {"class": GaussianProcessRegressor, "params": {
+                "alpha": ("float", 1e-10, 1e-6),
+                "normalize_y": ("categorical", [True, False]),
+                "kernel": ("categorical", [
+                    RBF(),
+                    Matern(),
+                    RationalQuadratic(),
+                    DotProduct()])
+            }}
+        }
+
+        best_model = None
 
         # Iterate over targets and models
         for label_idx in range(n_targets):
 
-            print(f"\nOptimizing models for target {self.target_names[label_idx]} {label_idx + 1}/{n_targets}...")
+            print(f"\nOptimizing models for target {self.target_names[label_idx]} "
+                  f"{label_idx + 1}/{n_targets}...")
             for name, cfg in model_configs.items():
                 print(f"\nOptimizing {name}...")
                 self.current_name = name
 
                 ModelClass = cfg["class"]
                 param_bounds = cfg["params"]
-                
-                def objective(trial):
 
+                n_timed_out = [0]
+
+                def objective(trial):
+                    global _FIT_DEADLINE
+
+                    _FIT_DEADLINE = (time.monotonic() + trial_timeout
+                                     if trial_timeout else None)
                     try:
 
                         params = {}
@@ -522,12 +442,16 @@ class ModelOptimization:
                                 params[name_] = trial.suggest_float(name_, cfg[1], cfg[2], log=True)
                             elif ptype == "categorical":
                                 params[name_] = trial.suggest_categorical(name_, cfg[1])
-                        
-                        model = ModelClass(**params)
-                        
+
+                        # Same optimiser as sklearn's default, but it honours
+                        # the trial deadline.
+                        model = ModelClass(**params, optimizer=_time_limited_lbfgs)
+
                         fold_scores = []
 
                         for fold_idx, dataset_dict in enumerate(folds_per_label[f"label_{label_idx}"]):
+                            if _FIT_DEADLINE is not None and time.monotonic() > _FIT_DEADLINE:
+                                raise TrialTimeLimitExceeded()
                             model_fold = clone(model)
                             train_df = dataset_dict["train"]
                             val_df = dataset_dict["validation"]
@@ -535,49 +459,125 @@ class ModelOptimization:
                             X_train_fold = np.vstack(train_df["sequence"])
                             X_val_fold = np.vstack(val_df["sequence"])
 
-                            if not self.classification:
-                                y_train_fold = np.vstack(train_df["score"]).ravel()
-                                y_val_fold = np.vstack(val_df["score"]).ravel()
+                            y_train_fold = np.vstack(train_df["score"]).ravel()
+                            y_val_fold = np.vstack(val_df["score"]).ravel()
 
-                                model_fold.fit(X_train_fold, y_train_fold)
-                                y_pred = model_fold.predict(X_val_fold)
+                            model_fold.fit(X_train_fold, y_train_fold)
+                            y_pred = model_fold.predict(X_val_fold)
 
-                                mse = mean_squared_error(y_val_fold, y_pred)
-                                fold_scores.append(mse)
-
-                            else:
-                                y_train_fold = train_df["score"].astype(int)
-                                y_val_fold = val_df["score"].astype(int)
-
-                                model_fold.fit(X_train_fold, y_train_fold)
-
-                                y_proba = model_fold.predict_proba(X_val_fold)
-                                label_enc = self.label_enc[self.target_names[label_idx]]
-                                loss = log_loss(y_val_fold, y_proba, labels=label_enc.transform(label_enc.classes_))
-
-                                fold_scores.append(loss)
+                            mse = mean_squared_error(y_val_fold, y_pred)
+                            fold_scores.append(mse)
 
                         return np.mean(fold_scores)
-                    except:
+                    except TrialTimeLimitExceeded:
+                        n_timed_out[0] += 1
+                        kernel = params.get("kernel")
+                        print(f"  trial {trial.number} stopped after {trial_timeout} s "
+                              f"(kernel={kernel}, alpha={params.get('alpha', float('nan')):.3g}, "
+                              f"normalize_y={params.get('normalize_y')})", flush=True)
                         raise optuna.TrialPruned()
-                
-                optuna.logging.set_verbosity(optuna.logging.ERROR) 
-                study = optuna.create_study(direction='minimize', sampler=optuna.samplers.TPESampler(seed=random_seed))
-                study.optimize(objective, n_trials=n_trials, show_progress_bar=optuna_print)
-                
-                best_params = study.best_params
-                
+                    except Exception:
+                        raise optuna.TrialPruned()
+                    finally:
+                        _FIT_DEADLINE = None
+
+                optuna.logging.set_verbosity(optuna.logging.ERROR)
+                study = optuna.create_study(
+                    direction='minimize',
+                    sampler=optuna.samplers.TPESampler(seed=random_seed)
+                )
+                t_start = time.monotonic()
+                study.optimize(objective, n_trials=n_trials, timeout=round_timeout,
+                               show_progress_bar=optuna_print)
+                elapsed = time.monotonic() - t_start
+
+                completed = [t for t in study.trials
+                             if t.state == optuna.trial.TrialState.COMPLETE]
+                n_run = len(study.trials)
+                note = ""
+                if n_run < n_trials:
+                    note += f"; round time limit ({round_timeout} s) reached"
+                if n_timed_out[0]:
+                    note += f"; {n_timed_out[0]} trial(s) hit the trial time limit"
+                print(f"  Optuna: {n_run}/{n_trials} trials, {len(completed)} completed, "
+                      f"{elapsed:.0f} s{note}", flush=True)
+
+                if completed:
+                    best_params = study.best_params
+                else:
+                    print("  No trial completed; using the fallback GPR "
+                          f"{FALLBACK_GPR_PARAMS}", flush=True)
+                    best_params = dict(FALLBACK_GPR_PARAMS)
+
                 best_model = ModelClass(**best_params)
 
         return best_model, y_train, y_test
-    
+
+    @staticmethod
+    def select_candidates(pred_scores, n_select, strategy="greedy", explore_frac=0.3):
+        """Indices of the sequences to acquire from the remaining pool.
+
+        Parameters
+        ----------
+        pred_scores : array
+            Predicted score for every sequence still in the pool.
+        n_select : int
+            Batch size. Clipped to the pool size on the final rounds.
+        strategy : {"greedy", "mixed"}
+            ``greedy`` takes the n_select highest-predicted sequences.
+            ``mixed`` takes ``round(explore_frac * n_select)`` from the
+            lowest-predicted and the rest from the highest-predicted.
+        explore_frac : float
+            Fraction of the batch drawn from the predicted worst. Ignored for
+            ``greedy``.
+
+        Returns
+        -------
+        numpy.ndarray
+            Unique positional indices into ``pred_scores``.
+        """
+        if strategy not in ACQUISITION_STRATEGIES:
+            raise ValueError(
+                f"strategy must be one of {ACQUISITION_STRATEGIES}, got {strategy!r}"
+            )
+
+        pool = len(pred_scores)
+        n_select = int(min(n_select, pool))
+        if n_select <= 0:
+            return np.array([], dtype=int)
+
+        order = np.argsort(pred_scores)
+
+        if strategy == "greedy":
+            return order[-n_select:][::-1]
+
+        # mixed: split the batch between the predicted best and the predicted worst.
+        n_worst = int(round(explore_frac * n_select))
+        n_worst = min(n_worst, n_select)
+        n_best = n_select - n_worst
+
+        # On the last rounds the pool can be smaller than best + worst, which
+        # would make the two slices overlap and acquire the same sequence twice.
+        if n_best + n_worst > pool:
+            n_worst = max(0, pool - n_best)
+
+        best_idx = order[-n_best:][::-1] if n_best > 0 else np.array([], dtype=int)
+        worst_idx = order[:n_worst] if n_worst > 0 else np.array([], dtype=int)
+
+        selected = np.concatenate([best_idx, worst_idx]).astype(int)
+
+        # Belt and braces: never return a duplicate, whatever the pool size.
+        _, first = np.unique(selected, return_index=True)
+        return selected[np.sort(first)]
+
     def pred(self, train_seqs, y_train, test_seqs, label_idx, best_model, score_col):
+        """Fit the tuned model on the acquired set and score the remaining pool."""
 
-        label_seq = [(f"train_{i}", seq) for i, seq in enumerate(train_seqs)]
-        X_train = self.compute_embeddings(sequences=label_seq, baseline=self.baseline)
-
-        label_seq_test = [(f"test_{i}", seq) for i, seq in enumerate(test_seqs)]
-        X_test = self.compute_embeddings(sequences=label_seq_test, baseline=self.baseline)
+        # fit=True refits the n-gram vocabulary on the current training set,
+        # which grows every acquisition round; the pool is then transformed
+        # with that vocabulary.
+        X_train = self.compute_embeddings(list(train_seqs), fit=True)
+        X_test = self.compute_embeddings(list(test_seqs), fit=False)
 
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train)
@@ -586,46 +586,27 @@ class ModelOptimization:
         model = clone(best_model)
         model.fit(X_train, y_train[:, label_idx])
 
-        if not self.classification:
-            pred_score_test = model.predict(X_test)
-            return pred_score_test
-        else:
-            proba = model.predict_proba(X_test)
-            le = self.label_enc[score_col[0]]
-            classes = le.classes_
+        return model.predict(X_test)
 
-            # Possible positive class names
-            positive_candidates = ["CPP", "Non-toxic"]
-
-            # Find which one exists in the model
-            positive_class = None
-            for cls in positive_candidates:
-                if cls in classes:
-                    positive_class = cls
-                    break
-
-            if positive_class is None:
-                raise ValueError(f"None of {positive_candidates} found in model.classes_: {classes}")
-
-            pos_index = list(classes).index(positive_class)
-
-            positive_proba = proba[:, pos_index]
-            return positive_proba
-
+    # ------------------------------------------------------------------
     def run_sim_hit_rate(
-                        self, 
+                        self,
                         data_paths,
                         dataset_names,
                         score_col=["score"],
                         new_samp_per_step=20,
                         max_num_samp=300,
-                        folds=10, 
-                        random_seed=42, 
+                        folds=10,
+                        random_seed=42,
                         n_seeds=5,
-                        n_trials=100, 
-                        baseline=False, 
-                        classification=False,
-                        optuna_print=True):
+                        n_trials=100,
+                        representation=None,
+                        acquisition="greedy",
+                        explore_frac=0.3,
+                        results_dir="./simulation_results",
+                        optuna_print=True,
+                        trial_timeout=None,
+                        round_timeout=None):
         """
         Run an iterative acquisition simulation to evaluate model-driven
         selection performance versus a random baseline.
@@ -633,16 +614,41 @@ class ModelOptimization:
         This function simulates an active-learning–style workflow where, at each
         round, a model selects new sequences from a test pool based on predicted
         scores.
-        """
-        os.makedirs("./simulation_results", exist_ok=True)
-        
-        if self.model_name.split("/")[0].lower() == "facebook":
-            self.load_model()
-        else:
-            raise ValueError(f"Foundation model needs to be an ESM2 model from Huggingface...")
 
-        self.classification = classification
-        target_candidates = ["CPP", "Non-toxic"]
+        Parameters
+        ----------
+        acquisition : {"greedy", "mixed"}
+            How the `new_samp_per_step` sequences are picked from the predictions.
+            "greedy" takes the top-k; "mixed" takes (1 - explore_frac) of the
+            batch from the top and explore_frac from the bottom, which is the
+            more exploratory strategy.
+        explore_frac : float
+            Fraction of each batch spent on the lowest-predicted sequences when
+            `acquisition="mixed"`. Ignored for "greedy".
+        trial_timeout, round_timeout : float or None
+            Wall-clock limits (seconds) for one Optuna trial and for the Optuna
+            study of one round. None = no limit. See the note on run-time limits
+            at the top of this module.
+        """
+        os.makedirs(results_dir, exist_ok=True)
+
+        if acquisition not in ACQUISITION_STRATEGIES:
+            raise ValueError(
+                f"acquisition must be one of {ACQUISITION_STRATEGIES}, got {acquisition!r}"
+            )
+        if not 0.0 <= explore_frac <= 1.0:
+            raise ValueError(f"explore_frac must be in [0, 1], got {explore_frac!r}")
+
+        if representation is not None:
+            if representation not in REPRESENTATIONS:
+                raise ValueError(
+                    f"representation must be one of {REPRESENTATIONS}, got {representation!r}"
+                )
+            self.representation = representation
+            self.representer.representation = representation
+
+        # Load the foundation model once, and only if it is the representation.
+        self.load_model()
 
         n_seeds = n_seeds
         start_seed = random_seed
@@ -657,7 +663,7 @@ class ModelOptimization:
             self.data_path = data_path
 
             for seed in seeds:
-                self.random_seed=seed
+                self.random_seed = seed
                 self.prep_data(score_col=score_col)
                 self.initialize_training_set()
 
@@ -670,17 +676,21 @@ class ModelOptimization:
                 all_selected_seqs = set(self.training_sequences)
 
                 # Simulation
-                
+
                 round_idx = -1
                 while len(self.training_sequences) < int(max_num_samp):
                     round_idx += 1
+                    t_round = time.monotonic()
+                    print(f"[{ds_name} seed {seed}] round {round_idx}: "
+                          f"{len(self.training_sequences)} training sequences", flush=True)
 
                     best_model, y_train, y_test = self.optimize_all_models(
-                        folds=folds, 
-                        random_seed=seed, 
-                        n_trials=n_trials, 
-                        baseline=baseline, 
-                        optuna_print=optuna_print
+                        folds=folds,
+                        random_seed=seed,
+                        n_trials=n_trials,
+                        optuna_print=optuna_print,
+                        trial_timeout=trial_timeout,
+                        round_timeout=round_timeout,
                     )
 
                     pred_scores = self.pred(
@@ -692,112 +702,85 @@ class ModelOptimization:
                         score_col=score_col
                     )
 
-                    if not self.classification:
+                    if round_idx == 0:
 
-                        if round_idx == 0:
-                        
-                            ### Selection performance normalized between the overall mean value and the highest 
-                            ### possible mean value based on the selection at each round
-                            mean_all = np.mean(self.y_all)
-                            highest_idx = np.argsort(self.y_all)[-new_samp_per_step:][::-1]
-                            highest_mean = np.mean(self.y_all[np.array(highest_idx)])
-                            selected_mean = np.mean(y_train[:, 0])
-                            norm_selected_mean = (selected_mean - mean_all) / (highest_mean - mean_all)
-                            rows.append([ds_name, seed, len(self.training_sequences), "Norm. Target Mean (Round)", norm_selected_mean, baseline])
-
-
-                        # Select top predicted
-                        pred_idx = np.argsort(pred_scores)[-new_samp_per_step:][::-1]
-
-                        ### Selection performance normalized between the overall mean value and the highest 
+                        ### Selection performance normalized between the overall mean value and the highest
                         ### possible mean value based on the selection at each round
-                        mean_all = np.mean(y_test[:, 0])
-                        highest_idx = np.argsort(y_test[:, 0])[-new_samp_per_step:][::-1]
-                        highest_mean = np.mean(y_test[:, 0][np.array(highest_idx)])
-                        selected_mean = np.mean(y_test[:, 0][np.array(pred_idx)])
-                        norm_selected_mean = (selected_mean - mean_all) / (highest_mean - mean_all)
-                        rows.append([ds_name, seed, len(self.training_sequences)+new_samp_per_step, "Norm. Target Mean (Round)", norm_selected_mean, baseline])
-
-                        ### Cumulative performance of entire training data set normalized from overall mean value to
-                        ### highest possible mean based on current number of samples in training data
-                        current_mean = np.mean(y_train[:, 0])
-                        highest_idx = np.argsort(self.y_all)[-len(y_train[:, 0]):][::-1]
-                        highest_mean = np.mean(self.y_all[np.array(highest_idx)])
                         mean_all = np.mean(self.y_all)
-                        norm_current_mean = (current_mean - mean_all) / (highest_mean - mean_all)
-                        rows.append([ds_name, seed, len(self.training_sequences), "Norm. Target Mean (Cumulative)", norm_current_mean, baseline])
+                        highest_idx = np.argsort(self.y_all)[-new_samp_per_step:][::-1]
+                        highest_mean = np.mean(self.y_all[np.array(highest_idx)])
+                        selected_mean = np.mean(y_train[:, 0])
+                        norm_selected_mean = (selected_mean - mean_all) / (highest_mean - mean_all)
+                        rows.append([ds_name, seed, len(self.training_sequences),
+                                     "Norm. Target Mean (Round)", norm_selected_mean,
+                                     self.representation, acquisition])
 
-                        ### Percentage of actual top 50 samples that have already been taken 
-                        overlap = len(top10pct_highest_seqs & all_selected_seqs)
-                        pct_top10pct = overlap / k * 100
-                        rows.append([ds_name, seed, len(self.training_sequences), "Top 10% peptides selected (%)", pct_top10pct, baseline])
+                    # Select the next batch with the requested strategy: either
+                    # the top-k predictions, or a best/worst mix.
+                    pred_idx = self.select_candidates(
+                        pred_scores,
+                        new_samp_per_step,
+                        strategy=acquisition,
+                        explore_frac=explore_frac,
+                    )
 
-                        ### Difference between mean score of the top 10% peptides that are avilable at each round and the mean of all data
-                        ### Normalized between max mean and global mean
-                        k_avail = int(np.ceil(len(y_test[:,0]) * 0.1))
+                    print(f"[{ds_name} seed {seed}] round {round_idx} done in "
+                          f"{time.monotonic() - t_round:.0f} s", flush=True)
 
-                        top10_idx = np.argsort(y_test[:,0])[-k_avail:]
-                        top10_mean = np.mean(y_test[:,0][top10_idx])
+                    # Exhausted pool: nothing left to acquire, so stop rather
+                    # than spin on an unchanging training set.
+                    if len(pred_idx) == 0:
+                        print(f"[{ds_name} seed {seed}] pool exhausted at "
+                              f"{len(self.training_sequences)} samples, stopping early.")
+                        break
 
-                        k_global = int(np.ceil(len(self.y_all) * 0.1))
-                        global_top10_mean = np.mean(np.sort(self.y_all)[-k_global:])
+                    ### Selection performance normalized between the overall mean value and the highest
+                    ### possible mean value based on the selection at each round
+                    # The batch can be shorter than new_samp_per_step if the pool
+                    # runs out, so normalise against a batch of the same size.
+                    n_sel = len(pred_idx)
+                    mean_all = np.mean(y_test[:, 0])
+                    highest_idx = np.argsort(y_test[:, 0])[-n_sel:][::-1]
+                    highest_mean = np.mean(y_test[:, 0][np.array(highest_idx)])
+                    selected_mean = np.mean(y_test[:, 0][np.array(pred_idx)])
+                    norm_selected_mean = (selected_mean - mean_all) / (highest_mean - mean_all)
+                    rows.append([ds_name, seed, len(self.training_sequences)+n_sel,
+                                 "Norm. Target Mean (Round)", norm_selected_mean,
+                                 self.representation, acquisition])
 
-                        top10_gap_norm = (top10_mean - mean_all) / (global_top10_mean - mean_all)
+                    ### Cumulative performance of entire training data set normalized from overall mean value to
+                    ### highest possible mean based on current number of samples in training data
+                    current_mean = np.mean(y_train[:, 0])
+                    highest_idx = np.argsort(self.y_all)[-len(y_train[:, 0]):][::-1]
+                    highest_mean = np.mean(self.y_all[np.array(highest_idx)])
+                    mean_all = np.mean(self.y_all)
+                    norm_current_mean = (current_mean - mean_all) / (highest_mean - mean_all)
+                    rows.append([ds_name, seed, len(self.training_sequences),
+                                 "Norm. Target Mean (Cumulative)", norm_current_mean,
+                                 self.representation, acquisition])
 
-                        rows.append([
-                            ds_name,
-                            seed,
-                            len(self.training_sequences),
-                            "Remaining Top10 Quality",
-                            top10_gap_norm,
-                            baseline
-                        ])
+                    ### Percentage of the true top 10% that has already been acquired
+                    overlap = len(top10pct_highest_seqs & all_selected_seqs)
+                    pct_top10pct = overlap / k * 100
+                    rows.append([ds_name, seed, len(self.training_sequences),
+                                 "Top 10% peptides selected (%)", pct_top10pct,
+                                 self.representation, acquisition])
 
-                    else:
-                        
-                        if round_idx == 0:
-                        
-                            ### Enrichment factor per selection round
-                            le = self.label_enc[score_col[0]]
-                            total = len(y_train[:, 0])
+                    ### Difference between mean score of the top 10% peptides that are available at each round
+                    ### and the mean of all data, normalized between max mean and global mean
+                    k_avail = int(np.ceil(len(y_test[:, 0]) * 0.1))
 
-                            for label in target_candidates:
-                                if label in le.classes_:
-                                    encoded_value = le.transform([label])[0]
-                                    portion = np.sum(y_train[:, 0] == encoded_value) / total
+                    top10_idx = np.argsort(y_test[:, 0])[-k_avail:]
+                    top10_mean = np.mean(y_test[:, 0][top10_idx])
 
-                            ef_per_round = (portion / self.positive_label_freq[score_col[0]]) - 1
-                            rows.append([ds_name, seed, len(self.training_sequences), "Enrichment Factor (Round)", ef_per_round, baseline])
+                    k_global = int(np.ceil(len(self.y_all) * 0.1))
+                    global_top10_mean = np.mean(np.sort(self.y_all)[-k_global:])
 
-                        # Select top predicted
-                        pred_idx = np.argsort(pred_scores)[-new_samp_per_step:][::-1]
-                        y_selection = y_test[:, 0][np.array(pred_idx)]
+                    top10_gap_norm = (top10_mean - mean_all) / (global_top10_mean - mean_all)
 
-                        ### Enrichment factor per selection round
-                        le = self.label_enc[score_col[0]]
-                        total = len(y_selection)
-
-                        for label in target_candidates:
-                            if label in le.classes_:
-                                encoded_value = le.transform([label])[0]
-                                portion = np.sum(y_selection == encoded_value) / total
-                                positive_label_freq = np.sum(y_test[:, 0] == encoded_value) / len(y_test[:, 0])
-
-                        ef_per_round = (portion / positive_label_freq) - 1
-                        rows.append([ds_name, seed, len(self.training_sequences)+new_samp_per_step, "Enrichment Factor (Round)", ef_per_round, baseline])
-
-                        ### Enrichment Factor (Cumulative)
-                        le = self.label_enc[score_col[0]]
-                        total = len(y_train[:, 0])
-
-                        for label in target_candidates:
-                            if label in le.classes_:
-                                encoded_value = le.transform([label])[0]
-                                portion = np.sum(y_train[:, 0] == encoded_value) / total
-
-                        ef_cumulative = (portion / self.positive_label_freq[score_col[0]]) - 1
-                        rows.append([ds_name, seed, len(self.training_sequences), "Enrichment Factor (Cumulative)", ef_cumulative, baseline])
-
+                    rows.append([ds_name, seed, len(self.training_sequences),
+                                 "Remaining Top10 Quality", top10_gap_norm,
+                                 self.representation, acquisition])
 
                     # Update new training set
                     selected_seqs = [self.test_sequences[i] for i in pred_idx]
@@ -807,90 +790,123 @@ class ModelOptimization:
                     mask = np.ones(len(self.test_sequences), dtype=bool)
                     mask[pred_idx] = False
                     self.test_sequences = [s for i, s in enumerate(self.test_sequences) if mask[i]]
-                    self.test_df = self.test_df[self.test_df["sequence"].isin(self.test_sequences)].reset_index(drop=True)
+                    self.test_df = self.test_df[
+                        self.test_df["sequence"].isin(self.test_sequences)
+                    ].reset_index(drop=True)
 
                     all_selected_seqs.update(selected_seqs)
 
-                ### Cumulative performance of entire training data set normalized from overall mean value to
-                ### highest possible mean based on current number of samples in training data
+                ### Final round bookkeeping
                 y_train = []
                 for s in self.training_sequences:
                     y_train.append(self.seq_to_score[s])
                 y_train = np.array(y_train)
                 if y_train.ndim == 1:
                     y_train = y_train.reshape(-1, 1)
-                    
-                if not self.classification:
-                    current_mean = np.mean(y_train[:, 0])
-                    highest_idx = np.argsort(self.y_all)[-len(y_train[:, 0]):][::-1]
-                    highest_mean = np.mean(self.y_all[np.array(highest_idx)])
-                    mean_all = np.mean(self.y_all)
-                    norm_current_mean = (current_mean - mean_all) / (highest_mean - mean_all)
-                    rows.append([ds_name, seed, len(self.training_sequences), "Norm. Target Mean (Cumulative)", norm_current_mean, baseline])
-                    
-                    ### Percentage of actual top 50 samples that have already been taken 
-                    overlap = len(top10pct_highest_seqs & all_selected_seqs)
-                    pct_top10pct = overlap / k * 100
-                    rows.append([ds_name, seed, len(self.training_sequences), "Top 10% peptides selected (%)", pct_top10pct, baseline])
 
-                    ### Difference between mean score of the top 10% peptides that are avilable at each round and the mean of all data
-                    ### Normalized between max mean and global mean
-                    k_avail = int(np.ceil(len(y_test[:,0]) * 0.1))
+                current_mean = np.mean(y_train[:, 0])
+                highest_idx = np.argsort(self.y_all)[-len(y_train[:, 0]):][::-1]
+                highest_mean = np.mean(self.y_all[np.array(highest_idx)])
+                mean_all = np.mean(self.y_all)
+                norm_current_mean = (current_mean - mean_all) / (highest_mean - mean_all)
+                rows.append([ds_name, seed, len(self.training_sequences),
+                             "Norm. Target Mean (Cumulative)", norm_current_mean,
+                             self.representation, acquisition])
 
-                    top10_idx = np.argsort(y_test[:,0])[-k_avail:]
-                    top10_mean = np.mean(y_test[:,0][top10_idx])
+                ### Percentage of the true top 10% that has already been acquired
+                overlap = len(top10pct_highest_seqs & all_selected_seqs)
+                pct_top10pct = overlap / k * 100
+                rows.append([ds_name, seed, len(self.training_sequences),
+                             "Top 10% peptides selected (%)", pct_top10pct,
+                             self.representation, acquisition])
 
-                    k_global = int(np.ceil(len(self.y_all) * 0.1))
-                    global_top10_mean = np.mean(np.sort(self.y_all)[-k_global:])
+                ### Remaining pool quality
+                k_avail = int(np.ceil(len(y_test[:, 0]) * 0.1))
 
-                    top10_gap_norm = (top10_mean - mean_all) / (global_top10_mean - mean_all)
+                top10_idx = np.argsort(y_test[:, 0])[-k_avail:]
+                top10_mean = np.mean(y_test[:, 0][top10_idx])
 
-                    rows.append([
-                        ds_name,
-                        seed,
-                        len(self.training_sequences),
-                        "Remaining Top10 Quality",
-                        top10_gap_norm,
-                        baseline
-                    ])
-                else:
-                    ### Enrichment Factor (Cumulative)
-                    le = self.label_enc[score_col[0]]
-                    total = len(y_train[:, 0])
+                k_global = int(np.ceil(len(self.y_all) * 0.1))
+                global_top10_mean = np.mean(np.sort(self.y_all)[-k_global:])
 
-                    for label in target_candidates:
-                        if label in le.classes_:
-                            encoded_value = le.transform([label])[0]
-                            portion = np.sum(y_train[:, 0] == encoded_value) / total
+                top10_gap_norm = (top10_mean - mean_all) / (global_top10_mean - mean_all)
 
-                    ef_cumulative = (portion / self.positive_label_freq[score_col[0]]) - 1
-                    rows.append([ds_name, seed, len(self.training_sequences), "Enrichment Factor (Cumulative)", ef_cumulative, baseline])
-                    
-        df_all = pd.DataFrame(
-            rows,
-            columns=["Dataset", "Seed", "Num_samples", "Metric", "Value", "Baseline"]
-        )
+                rows.append([ds_name, seed, len(self.training_sequences),
+                             "Remaining Top10 Quality", top10_gap_norm,
+                             self.representation, acquisition])
 
-        def save_or_append(df, filepath):
-            filepath = Path(filepath)
-            
-            if filepath.exists():
-                df.to_csv(filepath, mode="a", header=False, index=False)
-            else:
-                df.to_csv(filepath, mode="w", header=True, index=False)
-        
-        save_or_append(df_all, "./simulation_results/df_all.csv")
+        df_all = pd.DataFrame(rows, columns=RESULT_COLUMNS)
 
-        
-    def visualize(self, dataset_names):
+        # One file per (dataset, representation, strategy, seed). Array tasks run
+        # at the same time, and appending them all to one CSV interleaves the
+        # writes and leaves torn lines. Separate files also mean a re-run task
+        # replaces its own results instead of adding a second copy.
+        run_dir = Path(results_dir) / RUNS_SUBDIR
+        run_dir.mkdir(parents=True, exist_ok=True)
+        for (ds_name, seed), part in df_all.groupby(["Dataset", "Seed"], sort=False):
+            out = run_dir / run_file_name(ds_name, self.representation,
+                                          acquisition, seed)
+            part.to_csv(out, index=False)
+            print(f"Wrote {len(part)} rows to {out}", flush=True)
 
-        os.makedirs("./simulation_results/figures", exist_ok=True)
-        df = pd.read_csv("./scripts/simulation_results/df_all.csv", sep=None, engine='python')
-        df.loc[df["Dataset"] == "AMP_Ecoli", "Dataset"] = "Short AMPs"
+    # ------------------------------------------------------------------
+    def visualize(self, dataset_names, dataset_sizes=None,
+                  results_dir="./simulation_results",
+                  results_csv=None,
+                  figures_dir="./simulation_results/figures",
+                  n_cols=3, max_num_samp=200, new_samp_per_step=20,
+                  explore_frac=0.3, acquisitions=None, figure_suffix=""):
+        """Per-dataset acquisition curves.
+
+        Colour encodes the sequence representation and line style the candidate
+        selection strategy, so both can be compared in one panel.
+
+        Parameters
+        ----------
+        dataset_names : list[str]
+            Datasets to plot, in panel order.
+        results_dir : str
+            Results folder. Read are every per-run file in its ``runs``
+            sub-folder and, if present, a legacy ``df_all.csv`` beside it.
+        results_csv : str, optional
+            A specific legacy CSV to read instead of ``<results_dir>/df_all.csv``.
+        dataset_sizes : dict[str, int], optional
+            Pool size per dataset, used to draw the random-selection reference
+            on the "Top 10% peptides selected (%)" panels. Datasets missing
+            from the dict simply get no reference line.
+        explore_frac : float
+            Only used to write the legend label for the "mixed" strategy, so it
+            matches the fraction the simulation was run with.
+        acquisitions : list[str], optional
+            Restrict the figure to these strategies (e.g. ``["greedy"]`` to
+            reproduce the single-strategy figure). Default: everything present.
+        figure_suffix : str
+            Appended to the output file names, handy when writing one figure per
+            strategy.
+        """
+
+        os.makedirs(figures_dir, exist_ok=True)
+        df = load_results(results_dir=results_dir, results_csv=results_csv)
+        print(f"{len(df)} rows: "
+              f"{df['Dataset'].nunique()} datasets, "
+              f"{sorted(df['Representation'].unique())}, "
+              f"{sorted(df['Acquisition'].unique())}")
+
+        if acquisitions is not None:
+            df = df[df["Acquisition"].isin(acquisitions)]
+            if df.empty:
+                raise ValueError(f"No rows for acquisition strategies {acquisitions}.")
+
+        df["Model Label"] = df["Representation"].map(REPRESENTATION_LABELS)
+        model_order = [REPRESENTATION_LABELS[r] for r in REPRESENTATIONS
+                       if REPRESENTATION_LABELS[r] in set(df["Model Label"])]
+        acq_order = [a for a in ACQUISITION_STRATEGIES
+                     if a in set(df["Acquisition"])]
+        acq_labels = {a: acquisition_label(a, explore_frac) for a in acq_order}
 
         sns.set_theme(
             context="notebook",
-            style="white",   
+            style="white",
             rc={
                 "font.family": "sans-serif",
                 "font.sans-serif": ["DejaVu Sans"],
@@ -905,245 +921,112 @@ class ModelOptimization:
             }
         )
 
-        data_size_dict = {"A0A247D711_LISMN": 1653,
-                          "DN7A_SACS2": 1008,
-                          "ENVZ_ECOLI": 1121,
-                          "FKBP3_HUMAN": 1237,
-                          "MAFG_MOUSE_sub": 1429,
-                          "POLG_PESV_sub": 5130,
-                          "SBI_STAAM": 1025,
-                          "SDA_BACSU": 2770,
-                          "SOX30_HUMAN": 1010,
-                          "YNZC_BACSU_sub": 2300,
-                          "Short AMPs": 1212}
-        data_sizes = np.linspace(20, 200, 10)
-        y_pct_random = {}
-        for (data_name, data_size) in data_size_dict.items():
-            y_pct_random[data_name] = [i / data_size * 100 for i in data_sizes]
+        dataset_sizes = dataset_sizes or {}
+        n_steps = int(np.ceil((max_num_samp - self.initial_train_size) / new_samp_per_step)) + 1
+        data_sizes = np.linspace(self.initial_train_size, max_num_samp, n_steps)
+        y_pct_random = {
+            name: [i / size * 100 for i in data_sizes]
+            for name, size in dataset_sizes.items()
+        }
 
-        metrics_dict = {"per_round": ["Norm. Target Mean (Round)", "Enrichment Factor (Round)"],
-                   "cumulative": ["Norm. Target Mean (Cumulative)", "Enrichment Factor (Cumulative)"],
-                   "selection": ["Top 10% peptides selected (%)"]}
-        palette = ['#e6194b', 
-                   '#3cb44b', 
-                   '#ffe119', 
-                   '#4363d8', 
-                   '#f58231', 
-                   '#911eb4', 
-                   '#46f0f0', 
-                   '#f032e6', 
-                   '#bcf60c', 
-                   '#fabebe', 
-                   '#008080', 
-                   '#e6beff', 
-                   '#9a6324', 
-                   '#fffac8', 
-                   '#800000', 
-                   '#aaffc3', 
-                   '#808000', 
-                   '#ffd8b1', 
-                   '#000075', 
-                   '#808080', 
-                   '#ffffff', 
-                   '#000000']
-        color_gpr = "#7eb9db"
-        color_desc = "#e56e8c"
-        color_et = "#41431B"
-        color_et_desc = "#AEB784"
-        dataset_color = {"False": color_gpr,
-                         "True": color_desc,
-                         "ET": color_et,
-                         "ET_desc": color_et_desc}
+        metrics_groups = {
+            "per_round": ["Norm. Target Mean (Round)"],
+            "cumulative": ["Norm. Target Mean (Cumulative)"],
+            "selection": ["Top 10% peptides selected (%)"],
+            "remaining": ["Remaining Top10 Quality"],
+        }
+
+        pretty = {
+            "Norm. Target Mean (Round)": "Target mean (Round)",
+            "Norm. Target Mean (Cumulative)": "Target mean (Cumulative)",
+        }
 
         letters = list(string.ascii_lowercase)
-        
-        metric_idx = -1
-        for metrics in metrics_dict.values():
-            metric_idx += 1
 
-            # ---- Create figure ----
-            fig = plt.figure(figsize=(14, 16))
-            gs = GridSpec(5, 3, figure=fig, hspace=0.65, wspace=0.02)
-            if metric_idx == 2:
-                fig = plt.figure(figsize=(14, 14))
-                gs = GridSpec(4, 3, figure=fig, hspace=0.65, wspace=0.02)
-
-            axes = []
+        for group_name, metrics in metrics_groups.items():
             for metric in metrics:
-                print(metric)
 
                 df_metric = df[df["Metric"] == metric]
-                if metric == "Norm. Target Mean (Round)":
-                    metric = "Target mean (Round)"
-                elif metric == "Norm. Target Mean (Cumulative)":
-                    metric = "Target mean (Cumulative)"
+                if df_metric.empty:
+                    print(f"No rows for metric {metric!r}, skipping.")
+                    continue
+
+                ylabel = pretty.get(metric, metric)
 
                 # Compute mean/std across seeds
                 summary = (
                     df_metric
-                    .groupby(["Dataset", "Num_samples", "Baseline"])["Value"]
+                    .groupby(["Dataset", "Num_samples", "Model Label", "Acquisition"])["Value"]
                     .agg(["mean", "std"])
                     .reset_index()
                 )
 
-                # ---- Compute global y-limits across ALL datasets ----
-                y_min = np.inf
-                y_max = -np.inf
+                # ---- Global y-limits across ALL datasets ----
+                present = [d for d in dataset_names if d in set(summary["Dataset"])]
+                if not present:
+                    print(f"None of the requested datasets are in the results for {metric!r}.")
+                    continue
 
-                for dataset in dataset_names:
-                    df_tmp = summary[summary["Dataset"] == dataset]
-                    if df_tmp.empty:
-                        continue
+                sub = summary[summary["Dataset"].isin(present)]
+                y_min = (sub["mean"] - sub["std"].fillna(0)).min()
+                y_max = (sub["mean"] + sub["std"].fillna(0)).max()
+                padding = 0.05 * (y_max - y_min) if y_max > y_min else 0.1
+                y_min = math.floor((y_min - padding) * 10) / 10
+                y_max = math.ceil((y_max + padding) * 10) / 10
 
-                    lower = (df_tmp["mean"] - df_tmp["std"]).min()
-                    upper = (df_tmp["mean"] + df_tmp["std"]).max()
+                n_rows = int(np.ceil(len(present) / n_cols))
+                fig = plt.figure(figsize=(4.7 * n_cols, 3.4 * n_rows + 1.2))
+                gs = GridSpec(n_rows, n_cols, figure=fig, hspace=0.55, wspace=0.06)
 
-                    y_min = min(y_min, lower)
-                    y_max = max(y_max, upper)
-
-                # Add small padding
-                padding = 0.05 * (y_max - y_min)
-                y_min -= padding
-                y_max += padding
-                y_min = math.floor(y_min * 10) / 10
-                y_max = math.ceil(y_max * 10) / 10
-
-                for i, dataset in enumerate(dataset_names):
-                    if i >= 11 and metric_idx == 2:
-                        continue
-
-                    row = i // 3
-                    col = i % 3
-
-                    if row == 3 and col == 2:
-                        row = 4
-                        col = 0
-                    elif row == 4 and col == 0:
-                        row = 4
-                        col = 1
-
+                for i, dataset in enumerate(present):
+                    row, col = i // n_cols, i % n_cols
                     ax = fig.add_subplot(gs[row, col])
-                    axes.append(ax)
 
-                    ax.text(
-                        0.02, 1.12,
-                        letters[i],
-                        transform=ax.transAxes,
-                        fontsize=11,
-                        fontweight="bold",
-                        fontfamily="DejaVu Serif",
-                        va="top",
-                        ha="left"
-                    )
+                    ax.text(0.02, 1.12, letters[i], transform=ax.transAxes,
+                            fontsize=11, fontweight="bold", fontfamily="DejaVu Serif",
+                            va="top", ha="left")
 
                     df_plot = summary[summary["Dataset"] == dataset]
 
-                    if df_plot.empty:
-                        ax.axis("off")
-                        continue
-                    
-                    if dataset not in ["CellPPD", "ToxinPred3"]:
-                        for baseline in [False, True]:
-                            df_temp = df_plot[df_plot["Baseline"] == baseline]
+                    for model in model_order:
+                        for acq in acq_order:
+                            df_temp = df_plot[
+                                (df_plot["Model Label"] == model)
+                                & (df_plot["Acquisition"] == acq)
+                            ].sort_values("Num_samples")
+                            if df_temp.empty:
+                                continue
                             x = df_temp["Num_samples"].values
                             y_mean = df_temp["mean"].values
-                            y_std = df_temp["std"].values
+                            y_std = df_temp["std"].fillna(0).values
+                            color = REPRESENTATION_COLORS[model]
 
-                            color = dataset_color[str(baseline)]
+                            ax.plot(x, y_mean, linewidth=2.2, color=color,
+                                    linestyle=ACQUISITION_LINESTYLES[acq],
+                                    label=f"{model} - {acq_labels[acq]}")
+                            # Only shade one strategy, otherwise overlapping
+                            # bands of the same colour become unreadable.
+                            if acq == acq_order[0]:
+                                ax.fill_between(x, y_mean - y_std, y_mean + y_std,
+                                                alpha=0.22, color=color)
 
-                            # Mean line
-                            ax.plot(x, y_mean, linewidth=2.2, color=color, label="GPR + Descriptors (Baseline)" if baseline else "GPR + ESM2 (SCARSE)")
-
-                            # Std shading
-                            ax.fill_between(
-                                x,
-                                y_mean - y_std,
-                                y_mean + y_std,
-                                alpha=0.25,
-                                color=color
-                            )
-                    else:
-                        for baseline in [False, True]:
-                            df_temp = df_plot[df_plot["Baseline"] == baseline]
-                            x = df_temp["Num_samples"].values
-                            y_mean = df_temp["mean"].values
-                            y_std = df_temp["std"].values
-
-                            color = dataset_color["ET" if baseline else "ET_desc"]
-
-                            # Mean line
-                            ax.plot(x, y_mean, linewidth=2.2, color=color, label="ET + Descriptors (Baseline)" if baseline else "ET + ESM2 (SCARSE)")
-
-                            # Std shading
-                            ax.fill_between(
-                                x,
-                                y_mean - y_std,
-                                y_mean + y_std,
-                                alpha=0.25,
-                                color=color
-                            )
-
-                    if col == 1 and row == 0 and metric != "Top 10% peptides selected (%)":
-                        color_map = {
-                            "GPR + ESM2 (SCARSE)": "#7eb9db",
-                            "GPR + Descriptors (Baseline)": "#e56e8c",
-                            "ET + ESM2 (SCARSE)": "#41431B",
-                            "ET + Descriptors (Baseline)": "#AEB784"
-                        }
-                        legend_handles = [Patch(facecolor=color_map[k], label=k) for k in color_map]
-
-                        ax.legend(
-                            handles=legend_handles,
-                            loc="upper center",
-                            ncol=4,
-                            bbox_to_anchor=(0.5, 1.5),
-                            frameon=False
-                        )
-                    elif col == 1 and row == 0 and metric == "Top 10% peptides selected (%)":
-                        handles, labels = ax.get_legend_handles_labels() 
-                        ax.legend( handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.5), frameon=False)
-
-                    # Random baseline
-                    if metric_idx == 2 and dataset in y_pct_random:
-                        ax.plot(
-                            data_sizes,
-                            y_pct_random[dataset],
-                            color="red",
-                            linewidth=1.8,
-                            linestyle="--",
-                            label="Random"
-                        )
+                    # Random selection reference
+                    if metric == "Top 10% peptides selected (%)" and dataset in y_pct_random:
+                        ax.plot(data_sizes, y_pct_random[dataset], color="red",
+                                linewidth=1.8, linestyle="--", label="Random")
 
                     ax.set_title(dataset)
+                    ax.set_ylim(y_min, y_max)
 
-                    # ---- Set identical y-limits ----
-                    if metric_idx == 2:
-                        ax.set_ylim(0, 40)
-                        yticks = np.linspace(0, 100, 11)
-                        ax.set_yticks(yticks)
-                    elif row != 4:
-                        ax.set_ylim(-0.6, 1.0)
-                        yticks = np.linspace(-0.6, 1.0, 9)
-                        ax.set_yticks(yticks)
-                    else:
-                        if metric_idx == 0:
-                            ax.set_ylim(-0.5, 2.5)
-                            yticks = np.linspace(-0.5, 2.5, 7)
-                            ax.set_yticks(yticks)
-                        else:
-                            ax.set_ylim(-0.6, 1.2)
-                            yticks = np.linspace(-0.6, 1.2, 10)
-                            ax.set_yticks(yticks)
-
-                    # ---- Only left column shows y-axis ----
                     if col == 0:
-                        ax.set_ylabel(metric)
+                        ax.set_ylabel(ylabel)
                     else:
                         ax.set_ylabel("")
                         ax.set_yticklabels([])
 
                     ax.set_xlabel("n peptides screened")
-                    ax.set_xticks(np.arange(20, 201, 20))
+                    ax.set_xticks(np.arange(self.initial_train_size, max_num_samp + 1,
+                                            new_samp_per_step * 2))
 
                     for spine in ax.spines.values():
                         spine.set_visible(True)
@@ -1151,19 +1034,33 @@ class ModelOptimization:
                     ax.grid(True, axis="y")
                     ax.grid(False, axis="x")
 
-            # Remove unused panels if < 15 datasets
-            total_plots = len(dataset_names)
-            for j in range(total_plots, 15):
-                if j >= 11 and metric_idx == 2:
-                    continue
-                row = j // 3
-                col = j % 3
-                ax = fig.add_subplot(gs[row, col])
-                ax.axis("off")
+                # Colour = representation, line style = selection strategy.
+                handles = [Patch(facecolor=REPRESENTATION_COLORS[m], label=m) for m in model_order]
+                if len(acq_order) > 1:
+                    handles += [
+                        plt.Line2D([0], [0], color="#333333",
+                                   linestyle=ACQUISITION_LINESTYLES[a],
+                                   linewidth=2.2, label=acq_labels[a])
+                        for a in acq_order
+                    ]
+                if metric == "Top 10% peptides selected (%)" and y_pct_random:
+                    handles.append(plt.Line2D([0], [0], color="red", linestyle="--",
+                                              label="Random"))
+                # Wrap onto a second row rather than squeezing the labels, and
+                # lift the legend when it does so it clears the top panels.
+                ncol = len(handles) if len(handles) <= 5 else int(np.ceil(len(handles) / 2))
+                legend_rows = int(np.ceil(len(handles) / ncol))
+                fig.legend(handles=handles, loc="upper center",
+                           ncol=ncol, frameon=False,
+                           bbox_to_anchor=(0.5, 1.0 + 0.02 * (legend_rows - 1)))
 
+                # GridSpec already sets the spacing; tight_layout would fight it.
+                out = os.path.join(figures_dir,
+                                   f"workflow_{group_name}{figure_suffix}.png")
+                plt.savefig(out, dpi=300, bbox_inches="tight")
+                print(f"Saved {out}")
+                plt.show()
 
-            plt.tight_layout(rect=[0, 0.05, 1, 0.96])
-            plt.show()
 
 if __name__ == "__main__":
     pass

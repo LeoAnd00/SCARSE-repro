@@ -1,36 +1,39 @@
+"""
+Selection analysis: cross-validation quality vs downstream selection performance.
+
+Fits a Gaussian process on a training set of a given size and records both
+cross-validation and held-out test metrics, so CV quality can be related to
+end-point active-learning performance.
+
+One sequence representation per run: the ESM2 foundation model, or one of the
+three baselines. See ``representations.py``.
+
+Regression only.
+"""
+
+import gc
 import random
 import warnings
+
 import numpy as np
-import gc
-from modlamp.descriptors import GlobalDescriptor
 import pandas as pd
-import torch
 import optuna
-import math
-from Levenshtein import distance as levenshtein_distance 
+from Levenshtein import distance as levenshtein_distance
+from sklearn.base import clone
 from sklearn.gaussian_process import GaussianProcessRegressor
-from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.gaussian_process.kernels import (
     RBF,
     Matern,
     RationalQuadratic,
     DotProduct
 )
-from sklearn.base import clone
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, accuracy_score, log_loss
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    f1_score,
-    confusion_matrix,
-    matthews_corrcoef,
-    roc_auc_score
-)
-from sklearn.model_selection import KFold, StratifiedKFold
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.model_selection import KFold
+from sklearn.preprocessing import StandardScaler
 from sklearn.exceptions import ConvergenceWarning
 from scipy.stats import spearmanr
-from transformers import AutoTokenizer, EsmModel
+
+from functions.representations import SequenceRepresenter, REPRESENTATIONS
 
 
 class ModelOptimization:
@@ -42,7 +45,19 @@ class ModelOptimization:
         initial_train_size=20,
         initial_test_size=500,
         emb_batch_size=64,
-        model_name="facebook/esm2_t33_650M_UR50D"):
+        representation="esm",
+        model_name="facebook/esm2_t33_650M_UR50D",
+        morgan_radius=2,
+        morgan_bits=2048,
+        ngram_range=(1, 3),
+        ngram_vectorizer="tfidf",
+        ngram_features=1024,
+    ):
+
+        if representation not in REPRESENTATIONS:
+            raise ValueError(
+                f"representation must be one of {REPRESENTATIONS}, got {representation!r}"
+            )
 
         # Parameters
         self.data_path = data_path
@@ -50,19 +65,30 @@ class ModelOptimization:
         self.initial_train_size = initial_train_size
         self.initial_test_size = initial_test_size
         self.emb_batch_size = emb_batch_size
+        self.representation = representation
         self.model_name = model_name
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = None
+
+        self.representer = SequenceRepresenter(
+            representation=representation,
+            model_name=model_name,
+            emb_batch_size=emb_batch_size,
+            random_seed=random_seed,
+            morgan_radius=morgan_radius,
+            morgan_bits=morgan_bits,
+            ngram_range=ngram_range,
+            ngram_vectorizer=ngram_vectorizer,
+            ngram_features=ngram_features,
+        )
 
         self.df = None
         self.seq_to_score = {}
         self.training_sequences = []
         self.test_sequences = []
+        self.levenshtein_split = False
 
         # Seed
         random.seed(self.random_seed)
         np.random.seed(self.random_seed)
-        torch.manual_seed(self.random_seed)
 
     def prep_data(self, seq_col="sequence", score_col=["score"]):
         
@@ -88,81 +114,19 @@ class ModelOptimization:
 
         # Create a mapping from sequence → list of scores if multiple columns
         if len(score_col) == 1:
-            self.seq_to_score = dict(zip(df[seq_col], df[score_col[0]]))
+            self.seq_to_score = dict(zip(df["sequence"], df[score_col[0]]))
         else:
-            self.seq_to_score = dict(zip(df[seq_col], df[score_col].values.tolist()))
+            self.seq_to_score = dict(zip(df["sequence"], df[score_col].values.tolist()))
 
         print("Finished preparing data!")
 
-    def load_model(self, model_name="ESM"):
-        
-        self.model_str_name = model_name.lower() 
-        if model_name.lower() == "esm":
-            print(f"Loading base pretrained ESM model: {self.model_name}")
-            model_source = self.model_name
+    def load_model(self):
+        """Load the foundation model, if the representation needs one."""
+        self.representer.load_model()
 
-            self.tokenizer = AutoTokenizer.from_pretrained(model_source, use_fast=False)
-            self.model = EsmModel.from_pretrained(model_source)
-
-            self.model = self.model.to(self.device)
-            self.model.eval()
-
-            print("ESM model loaded. Using device:", self.device)
-
-
-    def compute_embeddings(self, 
-                           sequences, 
-                           baseline=False, 
-                           batch_size=None):
-        
-        if batch_size is None:
-            batch_size = self.emb_batch_size
-
-        foundation_embeddings = []
-        X_physchem = []
-        n = len(sequences)
-
-        for i in range(0, n, batch_size):
-            batch = sequences[i:i+batch_size]
-            labels, seqs = zip(*batch)
-
-            if not baseline:
-
-                if self.model_str_name == "esm":
-                    encoded = self.tokenizer(
-                        list(seqs),
-                        return_tensors="pt",
-                        padding=True,
-                        truncation=True,
-                        max_length=1024  
-                    ).to(self.device)
-
-                    input_ids = encoded["input_ids"]
-                    attention_mask = encoded["attention_mask"]
-
-                    with torch.no_grad():
-                        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-                        hidden_states = outputs.hidden_states
-
-                    last_layer = hidden_states[-1:] 
-                    stacked = torch.stack(last_layer, dim=0) 
-                    mean_layers = stacked.mean(dim=0)
-
-                    for j, seq in enumerate(seqs):
-                        mask = attention_mask[j].bool().to(mean_layers.device)
-                        seq_emb = mean_layers[j, mask].mean(dim=0)
-                        foundation_embeddings.append(seq_emb.cpu().numpy())
-            else:
-                for j, seq in enumerate(seqs):
-                    feats = self.compute_generalizable_features(seq)
-                    X_physchem.append(feats.flatten())
-
-        if baseline:
-            all_embeddings = np.array(pd.DataFrame(X_physchem))
-        else:
-            all_embeddings = np.vstack(foundation_embeddings)
-
-        return all_embeddings
+    def compute_embeddings(self, sequences, fit=False, batch_size=None):
+        """Represent sequences. ``fit`` is only meaningful for TF-IDF n-grams."""
+        return self.representer.transform(sequences, fit=fit, batch_size=batch_size)
 
     def allocate_counts(self, total_size, proportions):
         raw_counts = proportions * total_size
@@ -301,184 +265,10 @@ class ModelOptimization:
                 self.test_df = sampled.reset_index(drop=True)
                 self.test_sequences = self.test_df["sequence"].tolist()
 
-    def compute_generalizable_features(self, seq):
-        
-        # Global features
-        global_desc = GlobalDescriptor([seq])
-        global_desc.calculate_all()
-        global_feats = global_desc.descriptor
-
-        # Amino acid composition
-        amino_acids = 'ACDEFGHIKLMNPQRSTVWY' 
-        seq_len = len(seq)
-        aa_counts = [seq.count(aa)/seq_len if seq_len > 0 else 0 for aa in amino_acids]
-
-        # Additional features inspired by HeliQuest
-        additional_features = self.additional_features_fun(seq)
-
-
-        combined_feats = np.concatenate([global_feats.flatten(), np.array(aa_counts), np.array(additional_features)]).reshape(1, -1)
-
-        return combined_feats
-
-    def additional_features_fun(self, seq):
-        
-        def assign_hydrophobicity(sequence, scale='Fauchere-Pliska'):  
-            """
-            Assigns a hydrophobicity value to each amino acid in the sequence
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            scales = {'Fauchere-Pliska': {'A':  0.31, 'R': -1.01, 'N': -0.60,
-                                'D': -0.77, 'C':  1.54, 'Q': -0.22,
-                                'E': -0.64, 'G':  0.00, 'H':  0.13,
-                                'I':  1.80, 'L':  1.70, 'K': -0.99,
-                                'M':  1.23, 'F':  1.79, 'P':  0.72,
-                                'S': -0.04, 'T':  0.26, 'W':  2.25,
-                                'Y':  0.96, 'V':  1.22},
-
-            'Eisenberg': {'A':  0.25, 'R': -1.80, 'N': -0.64,
-                        'D': -0.72, 'C':  0.04, 'Q': -0.69,
-                        'E': -0.62, 'G':  0.16, 'H': -0.40,
-                        'I':  0.73, 'L':  0.53, 'K': -1.10,
-                        'M':  0.26, 'F':  0.61, 'P': -0.07,
-                        'S': -0.26, 'T': -0.18, 'W':  0.37,
-                        'Y':  0.02, 'V':  0.54},
-            }
-
-            hscale = scales.get(scale, None)
-            if not hscale:
-                raise KeyError('{} is not a supported scale. '.format(scale))
-
-            hvalues = []
-            for aa in sequence:
-                sc_hydrophobicity = hscale.get(aa, None)
-                if sc_hydrophobicity is None:
-                    raise KeyError('Amino acid not defined in scale: {}'.format(aa))
-                hvalues.append(sc_hydrophobicity)
-
-            return hvalues
-
-        def calculate_moment(array, angle=100):
-            """Calculates the hydrophobic dipole moment from an array of hydrophobicity
-            values. Formula defined by Eisenberg, 1982 (Nature). Returns the average
-            moment (normalized by sequence length)
-
-            uH = sqrt(sum(Hi cos(i*d))**2 + sum(Hi sin(i*d))**2),
-            where i is the amino acid index and d (delta) is an angular value in
-            degrees (100 for alpha-helix, 180 for beta-sheet).
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            sum_cos, sum_sin = 0.0, 0.0
-            for i, hv in enumerate(array):
-                rad_inc = ((i*angle)*math.pi)/180.0
-                sum_cos += hv * math.cos(rad_inc)
-                sum_sin += hv * math.sin(rad_inc)
-            return math.sqrt(sum_cos**2 + sum_sin**2) / len(array)
-
-
-        def calculate_charge(sequence):
-            """
-            Calculates the charge of the peptide sequence at pH 7.4
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-            charge_dict = {'E': -1, 'D': -1, 'K': 1, 'R': 1}
-            sc_charges = [charge_dict.get(aa, 0) for aa in sequence]
-            return sum(sc_charges)
-
-
-        def calculate_discrimination(mean_uH, total_charge):
-            """
-            Returns a discrimination factor according to Rob Keller (IJMS, 2011)
-            A sequence with d>0.68 can be considered a potential lipid-binding region.
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-            d = 0.944*mean_uH + 0.33*total_charge
-            return d
-
-
-        def calculate_composition(sequence):
-            """
-            Returns a dictionary with percentages per classes
-
-            Author:
-            Joao Rodrigues
-            j.p.g.l.m.rodrigues@gmail.com
-            https://github.com/JoaoRodrigues/hydrophobic_moment/tree/main
-            """
-
-            # Residue character table
-            polar_aa = set(('S', 'T', 'N', 'H', 'Q', 'G'))
-            speci_aa = set(('P', 'C'))
-            apolar_aa = set(('A', 'L', 'V', 'I', 'M'))
-            charged_aa = set(('E', 'D', 'K', 'R'))
-            aromatic_aa = set(('W', 'Y', 'F'))
-
-            n_p, n_s, n_a, n_ar, n_c = 0, 0, 0, 0, 0
-            tot = 0
-            for aa in sequence:
-                tot += 1
-                if aa in polar_aa:
-                    n_p += 1
-                elif aa in speci_aa:
-                    n_s += 1
-                elif aa in apolar_aa:
-                    n_a += 1
-                elif aa in charged_aa:
-                    n_c += 1
-                elif aa in aromatic_aa:
-                    n_ar += 1
-
-            comp_dict = {'polar': n_p, 'special': n_s,
-                        'apolar': n_a, 'charged': n_c, 'aromatic': n_ar}
-            n_tot_pol = comp_dict['polar'] + comp_dict['charged']
-            n_tot_apol = comp_dict['apolar'] + comp_dict['aromatic'] + comp_dict['special'] 
-            n_charged = comp_dict['charged']  
-            n_aromatic = comp_dict['aromatic']  
-
-            return torch.cat([
-                    torch.tensor([n_tot_pol/tot]), # polar
-                    torch.tensor([n_tot_apol/tot]), # apolar          
-                    torch.tensor([n_charged/tot]), # charged
-                    torch.tensor([n_aromatic/tot]) # aromatic
-                ])
-        
-        # HeliQuest inspired features
-        z = calculate_charge(seq)
-        seq_h = assign_hydrophobicity(seq)
-        av_uH = calculate_moment(seq_h)
-        d = calculate_discrimination(av_uH, z)
-        aa_type_comp = calculate_composition(seq)
-
-        additional_features = torch.cat([
-            torch.tensor([av_uH]),
-            torch.tensor([d]),
-            aa_type_comp 
-        ])
-        return additional_features
-
-    def optimize_all_models(self, 
-                            folds=10, 
-                            random_seed=42, 
-                            n_trials=100, 
-                            baseline=False, 
+    def optimize_all_models(self,
+                            folds=10,
+                            random_seed=42,
+                            n_trials=100,
                             optuna_print=True):
         
         # Suppress convergence and feature name warnings
@@ -489,16 +279,13 @@ class ModelOptimization:
         ## Seed
         random.seed(random_seed)
         np.random.seed(random_seed)
-        torch.manual_seed(random_seed)
 
-        # Load foundation model
-        if self.model_name.split("/")[0].lower() == "facebook":
-            self.load_model()
-        else:
-            raise ValueError(f"Foundation model needs to be an ESM2 model from Huggingface...")
+        # Load the foundation model only when it is the representation in use.
+        self.load_model()
 
-        label_seq = [(f"train_{i}", seq) for i, seq in enumerate(self.training_sequences)]
-        X_train_temp = self.compute_embeddings(sequences=label_seq, baseline=baseline)
+        # fit=True lets the n-gram vectorizer learn its vocabulary here, on
+        # the training sequences only.
+        X_train_temp = self.compute_embeddings(self.training_sequences, fit=True)
 
         y_train = []
         for s in self.training_sequences:
@@ -562,8 +349,7 @@ class ModelOptimization:
         
         # Data to be used for evaluating on test data
         X_train = X_train_temp
-        label_seq_test = [(f"test_{i}", seq) for i, seq in enumerate(self.test_sequences)]
-        X_test = self.compute_embeddings(sequences=label_seq_test, baseline=baseline)
+        X_test = self.compute_embeddings(self.test_sequences, fit=False)
 
         scaler = StandardScaler()
         X_train = scaler.fit_transform(X_train)
@@ -645,10 +431,13 @@ class ModelOptimization:
                         mse = np.mean(fold_scores)
 
                         if mse < self.mse_tracker:
+                            # Pooled across folds, matching how CV R2 is computed.
+                            cv_rho, _ = spearmanr(y_vall_all, y_pred_all)
                             self.cv_scores = {
                                 "CV RMSE": float(np.sqrt(mse)),
                                 "CV MAE": float(mean_absolute_error(y_vall_all, y_pred_all)),
-                                "CV R2": float(r2_score(y_vall_all, y_pred_all))
+                                "CV R2": float(r2_score(y_vall_all, y_pred_all)),
+                                "CV Spearman Correlation": float(cv_rho) if np.isfinite(cv_rho) else np.nan,
                             }
                             self.mse_tracker = mse
 
@@ -697,6 +486,7 @@ class ModelOptimization:
                     "CV RMSE": self.cv_scores["CV RMSE"],
                     "CV MAE": self.cv_scores["CV MAE"],
                     "CV R2": self.cv_scores["CV R2"],
+                    "CV Spearman Correlation": self.cv_scores["CV Spearman Correlation"],
                     "Test MSE": mse_test,
                     "Test RMSE": rmse_test,
                     "Test MAE": mae_test,

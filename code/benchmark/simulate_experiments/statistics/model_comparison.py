@@ -7,49 +7,39 @@ import pingouin as pg
 from scipy import stats
 import seaborn as sns
 from scipy.stats import spearmanr
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, precision_score, recall_score
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from statsmodels.stats.anova import AnovaRM
 from statsmodels.stats.libqsturng import psturng, qsturng
-from matplotlib import cm
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import roc_curve, precision_recall_curve
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import roc_auc_score, average_precision_score, matthews_corrcoef, precision_score, recall_score
 import scikit_posthocs as sp
-
 
 import math
 
+# NOTE: adapted from the Polaris method-comparison code (see
+# model_comparison_README.md). Classification support has been removed, since
+# the benchmark is regression-only.
 
-def calc_regression_metrics(df, cycle_col, val_col, pred_col, thresh):
+
+def calc_regression_metrics(df, cycle_col, val_col, pred_col):
     """
-    Calculate regression metrics (MAE, MSE, R2, prec, recall) for each method and split
+    Calculate regression metrics (MAE, MSE, R2, rho) for each method and split
 
     :param df: input dataframe must contain columns [method, split] as well the columns specified in the arguments
     :param cycle_col: column indicating the cross-validation fold
     :param val_col: column with the ground truth value
     :param pred_col: column with predictions
-    :param thresh: threshold for binary classification
-    :return: a dataframe with [cv_cycle, method, split, mae, mse, r2, prec, recall]
+    :return: a dataframe with [cv_cycle, method, split, mae, mse, r2, rho]
     """
     df_in = df.copy()
-    metric_ls = ["mae", "mse", "r2", "rho", "prec", "recall"]
+    metric_ls = ["mae", "mse", "r2", "rho"]
     metric_list = []
-    df_in['true_class'] = df_in[val_col] > thresh
-    # Make sure the thresh variable creates 2 classes
-    assert len(df_in.true_class.unique()) == 2, "Binary classification requires two classes"
-    df_in['pred_class'] = df_in[pred_col] > thresh
 
     for k, v in df_in.groupby([cycle_col, "method", "split"]):
         cycle, method, split = k
         mae = mean_absolute_error(v[val_col], v[pred_col])
         mse = mean_squared_error(v[val_col], v[pred_col])
         r2 = r2_score(v[val_col], v[pred_col])
-        recall = recall_score(v.true_class, v.pred_class)
-        prec = precision_score(v.true_class, v.pred_class)
         rho, _ = spearmanr(v[val_col], v[pred_col])
-        metric_list.append([cycle, method, split, mae, mse, r2, rho, prec, recall])
+        metric_list.append([cycle, method, split, mae, mse, r2, rho])
     metric_df = pd.DataFrame(metric_list, columns=["cv_cycle", "method", "split"] + metric_ls)
     return metric_df
 
@@ -169,14 +159,27 @@ def make_boxplots_parametric(df, metric_ls):
         ax.set_xticklabels(new_xtick_labels)
     plt.tight_layout()
 
+def friedman_p(result):
+    """Uncorrected p-value from pg.friedman, whichever pingouin version is installed.
+
+    The column was renamed from "p-unc" to "p_unc" in pingouin 0.6.
+    """
+    for col in ("p_unc", "p-unc"):
+        if col in result.columns:
+            return float(result[col].iloc[0])
+    raise KeyError(f"No p-value column in pg.friedman output: {list(result.columns)}")
+
+
 def make_boxplots_nonparametric(df, metric_ls):
     sns.set_context('notebook')
     sns.set(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
     sns.set_style('whitegrid')
-    figure, axes = plt.subplots(1, 6, sharex=False, sharey=False, figsize=(28, 8))
+    figure, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=False,
+                                figsize=(4.7 * len(metric_ls), 8), squeeze=False)
+    axes = axes[0]
 
     for i, stat in enumerate(metric_ls):
-        friedman = pg.friedman(df, dv=stat, within="method", subject="cv_cycle")['p-unc'].values[0]
+        friedman = friedman_p(pg.friedman(df, dv=stat, within="method", subject="cv_cycle"))
         ax = sns.boxplot(y=stat, x="method", hue="method", ax=axes[i], data=df, palette="Set2", legend=False)
         title = stat.replace("_", " ").upper()
         ax.set_title(f"p={friedman:.1e}")
@@ -192,7 +195,9 @@ def make_boxplots_nonparametric(df, metric_ls):
 def make_sign_plots_nonparametric(df, metric_ls):
     heatmap_args = {'linewidths': 0.25, 'linecolor': '0.5', 'clip_on': True, 'square': True}
     sns.set(rc={'figure.figsize': (4, 3)}, font_scale=1.5)
-    figure, axes = plt.subplots(1, 6, sharex=False, sharey=True, figsize=(26, 8))
+    figure, axes = plt.subplots(1, len(metric_ls), sharex=False, sharey=True,
+                                figsize=(4.4 * len(metric_ls), 8), squeeze=False)
+    axes = axes[0]
 
     for i, stat in enumerate(metric_ls):
         pivot_df = df.pivot(index='cv_cycle', columns='method', values=stat)
@@ -201,7 +206,9 @@ def make_sign_plots_nonparametric(df, metric_ls):
         sub_ax.set_title(stat.upper())
 
 def make_critical_difference_diagrams(df, metric_ls):
-    figure, axes = plt.subplots(6, 1, sharex=True, sharey=False, figsize=(16, 10))
+    figure, axes = plt.subplots(len(metric_ls), 1, sharex=True, sharey=False,
+                                figsize=(16, 1.7 * len(metric_ls)), squeeze=False)
+    axes = axes[:, 0]
     for i, stat in enumerate(metric_ls):
         pivot_df = df.pivot(index='cv_cycle', columns='method', values=stat)
         pc = sp.posthoc_conover_friedman(pivot_df, p_adjust="holm")
@@ -343,23 +350,23 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
     Returns:
     None
     """
-    nrow = math.ceil(len(stats) / 3)
-    fig, ax = plt.subplots(nrow, 3, figsize=figsize)
+    ncol = min(3, len(stats))
+    nrow = math.ceil(len(stats) / ncol)
+    fig, ax = plt.subplots(nrow, ncol, figsize=figsize, squeeze=False)
 
     # Set defaults
+    maximize = ["Test R2", "Test Spearman Correlation", "Top 20 Accuracy"]
     for key in ["Test MSE",
                 "Test RMSE",
                 "Test MAE",
                 "Test R2",
-                "Test Spearman Correlation", 
-                "Test Accuracy", 
-                "Test Balanced Accuracy", 
-                "Test F1 (weighted)",
-                "Test MCC"]:
-        direction_dict.setdefault(key, 'maximize' if key in ["Test R2","Test Spearman Correlation", "Test Accuracy", "Test Balanced Accuracy", "Test F1 (weighted)","Test MCC"] else 'minimize')
+                "Test Spearman Correlation",
+                "Top 20 Accuracy"]:
+        direction_dict.setdefault(key, 'maximize' if key in maximize else 'minimize')
 
-    for key in ["Test R2","Test Spearman Correlation"]:
+    for key in ["Test R2", "Test Spearman Correlation"]:
         effect_dict.setdefault(key, 0.1)
+    effect_dict.setdefault("Top 20 Accuracy", 5.0)
 
     direction_dict = {k: v for k, v in direction_dict.items()}
     effect_dict = {k: v for k, v in effect_dict.items()}
@@ -367,8 +374,8 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
     for i, stat in enumerate(stats):
         stat = stat#.lower()
 
-        row = i // 3
-        col = i % 3
+        row = i // ncol
+        col = i % ncol
 
         if stat not in direction_dict:
             raise ValueError(f"Stat '{stat}' is missing in direction_dict. Please set its value.")
@@ -389,16 +396,16 @@ def make_mcs_plot_grid(df, stats, group_col, alpha=.05,
         hax.set_title(stat.upper(), fontsize=title_text_size)
 
     # If there are less plots than cells in the grid, hide the remaining cells
-    if (len(stats) % 3) != 0:
-        for i in range(len(stats), nrow * 3):
-            row = i // 3
-            col = i % 3
+    if (len(stats) % ncol) != 0:
+        for i in range(len(stats), nrow * ncol):
+            row = i // ncol
+            col = i % ncol
             ax[row, col].set_visible(False)
 
     plt.tight_layout()
 
 
-def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_col="method"):
+def make_scatterplot(df, val_col, pred_col, cycle_col="cv_cycle", group_col="method"):
     """
     Create scatter plots for each method showing the relationship between predicted and measured values.
 
@@ -406,18 +413,19 @@ def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_
     df (pd.DataFrame): Input dataframe containing the data.
     val_col (str): The column name for the ground truth values.
     pred_col (str): The column name for the predicted values.
-    thresh (float): Threshold for binary classification.
     cycle_col (str): The column name indicating the cross-validation fold. Default is "cv_cycle".
     group_col (str): The column name indicating the groups/methods. Default is "method".
 
     Returns:
     None
     """
-    df_split_metrics = calc_regression_metrics(df, cycle_col=cycle_col, val_col=val_col, pred_col=pred_col,
-                                               thresh=thresh)
+    df_split_metrics = calc_regression_metrics(df, cycle_col=cycle_col, val_col=val_col,
+                                               pred_col=pred_col)
     methods = df[group_col].unique()
 
-    fig, axs = plt.subplots(nrows=1, ncols=len(methods), figsize=(25, 10))
+    fig, axs = plt.subplots(nrows=1, ncols=len(methods), figsize=(6 * len(methods), 6),
+                            squeeze=False)
+    axs = axs[0]
 
     for ax, method in zip(axs, methods):
         df_method = df.query(f"{group_col} == @method")
@@ -426,17 +434,13 @@ def make_scatterplot(df, val_col, pred_col, thresh, cycle_col="cv_cycle", group_
         ax.plot([df_method[val_col].min(), df_method[val_col].max()],
                 [df_method[val_col].min(), df_method[val_col].max()], 'k--', lw=1)
 
-        ax.axhline(y=thresh, color='r', linestyle='--')
-        ax.axvline(x=thresh, color='r', linestyle='--')
         ax.set_title(method)
 
-        y_true = df_method[val_col] > thresh
-        y_pred = df_method[pred_col] > thresh
-        precision = precision_score(y_true, y_pred)
-        recall = recall_score(y_true, y_pred)
-
-        metrics_text = f"MAE: {df_metrics['mae'].mean():.2f}\nMSE: {df_metrics['mse'].mean():.2f}\nR2: {df_metrics['r2'].mean():.2f}\nrho: {df_metrics['rho'].mean():.2f}\nPrecision: {precision:.2f}\nRecall: {recall:.2f}"
-        ax.text(0.05, .5, metrics_text, transform=ax.transAxes, verticalalignment='top')
+        metrics_text = (f"MAE: {df_metrics['mae'].mean():.2f}\n"
+                        f"MSE: {df_metrics['mse'].mean():.2f}\n"
+                        f"R2: {df_metrics['r2'].mean():.2f}\n"
+                        f"rho: {df_metrics['rho'].mean():.2f}")
+        ax.text(0.05, .95, metrics_text, transform=ax.transAxes, verticalalignment='top')
         ax.set_xlabel('Predicted')
         ax.set_ylabel('Measured')
 
@@ -489,92 +493,4 @@ def make_ci_plot_grid(df_in, metric_list, group_col="method"):
         df_tukey, _, _, _ = rm_tukey_hsd(df_in, metric, group_col=group_col)
         ci_plot(df_tukey, ax_in=axes[i], name=metric)
     figure.suptitle("Multiple Comparison of Means\nTukey HSD, FWER=0.05")
-    plt.tight_layout()
-
-
-def recall_at_precision(y_true, y_score, precision_threshold=0.5, direction='greater'):
-    if direction not in ['greater', 'lesser']:
-        raise ValueError("Invalid direction. Expected one of: ['greater', 'lesser']")
-
-    y_true = np.array(y_true)
-    y_score = np.array(y_score)
-    thresholds = np.unique(y_score)
-    thresholds = np.sort(thresholds)
-
-    if direction == 'greater':
-        thresholds = np.sort(thresholds)
-    else:  
-        thresholds = np.sort(thresholds)[::-1]
-
-    for threshold in thresholds:
-        if direction == 'greater':
-            y_pred = y_score >= threshold
-        else:  
-            y_pred = y_score <= threshold
-
-        precision = precision_score(y_true, y_pred)
-        if precision >= precision_threshold:
-            recall = recall_score(y_true, y_pred)
-            return recall, threshold
-    return np.nan, None
-
-def calc_classification_metrics(df_in, cycle_col, val_col, prob_col, pred_col):
-    metric_list = []
-    for k, v in df_in.groupby([cycle_col, "method", "split"]):
-        cycle, method, split = k
-        roc_auc = roc_auc_score(v[val_col], v[prob_col])
-        pr_auc = average_precision_score(v[val_col], v[prob_col])
-        mcc = matthews_corrcoef(v[val_col], v[pred_col])
-        
-        recall, _ = recall_at_precision(v[val_col].astype(bool), v[prob_col], precision_threshold=0.8, direction='greater')
-        tnr, _ = recall_at_precision(~v[val_col].astype(bool), v[prob_col], precision_threshold=0.8, direction='lesser')
-
-        metric_list.append([cycle, method, split, roc_auc, pr_auc, mcc, recall, tnr])
-        
-    metric_df = pd.DataFrame(metric_list, columns=["cv_cycle", "method", "split",
-                                                    "roc_auc", "pr_auc", "mcc", "recall", "tnr"])
-    return metric_df
-
-
-def make_curve_plots(df):
-    df_plot = df.query("cv_cycle == 0 and split == 'scaffold'").copy()
-    color_map = plt.get_cmap('tab10')
-    le = LabelEncoder()
-    df_plot['color'] = le.fit_transform(df_plot['method'])
-    colors = color_map(df_plot['color'].unique())
-    val_col = "Sol"
-    prob_col = "Sol_prob"
-
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-    for (k, v), color in zip(df_plot.groupby("method"), colors):
-        roc_auc = roc_auc_score(v[val_col], v[prob_col])
-        pr_auc = average_precision_score(v[val_col], v[prob_col])
-        fpr, recall_pos, thresholds_roc = roc_curve(v[val_col], v[prob_col])
-        precision, recall, thresholds_pr = precision_recall_curve(v[val_col], v[prob_col])
-
-        _, threshold_recall_pos = recall_at_precision(v[val_col].astype(bool), v[prob_col], precision_threshold=0.8, direction='greater')
-        _, threshold_recall_neg = recall_at_precision(~v[val_col].astype(bool), v[prob_col], precision_threshold=0.8, direction='lesser')
-
-        fpr_recall_pos = fpr[np.abs(thresholds_roc - threshold_recall_pos).argmin()]
-        fpr_recall_neg = fpr[np.abs(thresholds_roc - threshold_recall_neg).argmin()]
-        recall_recall_pos = recall[np.abs(thresholds_pr - threshold_recall_pos).argmin()]
-        recall_recall_neg = recall[np.abs(thresholds_pr - threshold_recall_neg).argmin()]
-
-        axes[0].plot(fpr, recall_pos, label=f"{k} (ROC AUC={roc_auc:.03f})", color=color, alpha=0.75)
-        axes[1].plot(recall, precision, label=f"{k} (PR AUC={pr_auc:.03f})", color=color, alpha=0.75)
-
-        axes[0].axvline(fpr_recall_pos, color=color, linestyle=':', alpha=0.75)
-        axes[0].axvline(fpr_recall_neg, color=color, linestyle='--', alpha=0.75)
-        axes[1].axvline(recall_recall_pos, color=color, linestyle=':', alpha=0.75)
-        axes[1].axvline(recall_recall_neg, color=color, linestyle='--', alpha=0.75)
-
-    axes[0].plot([0, 1], [0, 1], "--", color="black", lw=0.5)
-    axes[0].set_xlabel("False Positive Rate")
-    axes[0].set_ylabel("True Positive Rate")
-    axes[0].set_title("ROC Curve")
-    axes[0].legend()
-    axes[1].set_xlabel("Recall")
-    axes[1].set_ylabel("Precision")
-    axes[1].set_title("Precision-Recall Curve")
-    axes[1].legend()
     plt.tight_layout()

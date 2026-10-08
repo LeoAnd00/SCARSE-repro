@@ -12,7 +12,7 @@ def save_summary(out_dir, save_path):
     standard deviation metrics across random seeds.
 
     Aggregation is performed per:
-        Dataset * Label * Modlamp *Foundation * Model * Train Size
+        Dataset * Label * Representation * Foundation * Model * Train Size
 
     Parameters
     ----------
@@ -21,9 +21,10 @@ def save_summary(out_dir, save_path):
         Expected directory structure:
             out_dir/
                 <dataset>/
-                    seed_<seed>/
-                        train_size_<n>/
-                            raw_simulation_summary.csv
+                    <representation_tag>/
+                        seed_<seed>/
+                            train_size_<n>/
+                                raw_simulation_summary.csv
     save_path : str
         File path where the aggregated summary CSV will be written.
 
@@ -44,28 +45,37 @@ def save_summary(out_dir, save_path):
 
     df.to_csv(save_path.split(".")[0] + "_all.csv", index=False)
 
-    metrics = ["CV MSE", "CV RMSE", "CV MAE", "CV R2", "Test MSE", "Test RMSE", "Test MAE", "Test R2", "Test Spearman Correlation"]
+    metrics = [
+        "CV MSE", "CV RMSE", "CV MAE", "CV R2", "CV Spearman Correlation",
+        "Test MSE", "Test RMSE", "Test MAE", "Test R2", "Test Spearman Correlation",
+    ]
+    metrics = [m for m in metrics if m in df.columns]
+
+    group_cols = ["Dataset", "Label", "Representation", "Foundation", "Model", "Train Size"]
+    missing = [c for c in group_cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Summary CSVs are missing expected columns: {missing}. Found: {df.columns.tolist()}. "
+            "Results produced before the representation refactor need to be re-run."
+        )
+
     summary_df = (
-        df.groupby(["Dataset", "Label", "Foundation", "Model", "Train Size"])[metrics]
+        df.groupby(group_cols)[metrics]
         .agg(["mean", "std"])
         .reset_index()
     )
 
+    # Flatten the MultiIndex columns into "<metric> Mean" / "<metric> Std"
     summary_df.columns = [
-        "Dataset", "Label", "Foundation", "Model", "Train Size",
-        "CV MSE Mean", "CV MSE Std",
-        "CV RMSE Mean", "CV RMSE Std",
-        "CV MAE Mean", "CV MAE Std",
-        "CV R2 Mean", "CV R2 Std",
-        "Test MSE Mean", "Test MSE Std",
-        "Test RMSE Mean", "Test RMSE Std",
-        "Test MAE Mean", "Test MAE Std",
-        "Test R2 Mean", "Test R2 Std",
-        "Test Spearman Correlation Mean", "Test Spearman Correlation Std"
+        col[0] if col[1] == "" else f"{col[0]} {col[1].capitalize()}"
+        for col in summary_df.columns.to_flat_index()
     ]
 
-    summary_df = summary_df.groupby(["Dataset", "Label"], group_keys=False).apply(
-        lambda df: df.sort_values(["Train Size", "Test MSE Mean"])
+    # Sort directly rather than via groupby().apply(): pandas 3 no longer passes
+    # the grouping columns into the applied function, which silently dropped
+    # "Dataset" and "Label" from the output.
+    summary_df = summary_df.sort_values(
+        ["Dataset", "Label", "Train Size", "Test MSE Mean"]
     ).reset_index(drop=True)
 
     summary_df.to_csv(save_path, index=False)

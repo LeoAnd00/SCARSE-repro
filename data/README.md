@@ -7,27 +7,29 @@ project-root/
 ├── data/
     ├── proteingym_dms/
     │    └── raw/
-    │       ├── DMS_ProteinGym_indels/
-    │       └── DMS_ProteinGym_substitutions/
+    │       ├── DMS_ProteinGym_indels/           per-assay CSVs
+    │       ├── DMS_ProteinGym_substitutions/    per-assay CSVs
+    │       ├── DMS_indels.csv                   assay reference table
+    │       └── DMS_substitutions.csv            assay reference table
     ├── ecoli_amps/
     │   └── raw/
-    │       ├── EC_X_train_40.csv/
-    │       ├── EC_X_val_40.csv/
-    │       └── EC_X_test_40.csv/
+    │       ├── EC_X_train_40.csv
+    │       ├── EC_X_val_40.csv
+    │       └── EC_X_test_40.csv
     ├── saureus_amps/
     │   └── raw/
-    │       ├── SA_X_train_40.csv/
-    │       ├── SA_X_val_40.csv/
-    │       └── SA_X_test_40.csv/
+    │       ├── SA_X_train_40.csv
+    │       ├── SA_X_val_40.csv
+    │       └── SA_X_test_40.csv
     ├── paeruginosa_amps/
     │   └── raw/
-    │       ├── PA_X_train_40.csv/
-    │       ├── PA_X_val_40.csv/
-    │       └── PA_X_test_40.csv/
+    │       ├── PA_X_train_40.csv
+    │       ├── PA_X_val_40.csv
+    │       └── PA_X_test_40.csv
     └── hemopi2/
         └── raw/
-            ├── independent_dataset.csv/
-            └── cross_val_dataset.csv/
+            ├── independent_dataset.csv
+            └── cross_val_dataset.csv
 ```
 2. Download all required data and place the files in the raw folder for each dataset. 
     * Substitution and indel DMS assay datasets: https://proteingym.org/download

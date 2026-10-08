@@ -100,8 +100,10 @@ active-learning workflow (see Benchmark C).
 ```
 project-root/
 ├── README.md                                   this file
-├── requirements.txt
-├── env.sif                                     Apptainer image the jobs run in
+├── requirements.txt                            pip dependencies
+├── environment.yml                             conda environment
+├── env.def                                     Apptainer recipe -> build env.sif
+│   (env.sif, the built image the jobs run in, is produced from env.def; not committed)
 │
 ├── data/
 │   ├── proteingym_dms/raw/{DMS_ProteinGym_substitutions,DMS_ProteinGym_indels}/
@@ -123,18 +125,17 @@ project-root/
     │   ├── simulate_experiments/                  benchmarks A and B
     │   │   ├── optimize_models.py
     │   │   ├── aggregate_simulation_results.py
+    │   │   ├── run_aggregate.sh                     A   (submit from here)
+    │   │   ├── run_aggregate_foundations.sh         B   (submit from here)
     │   │   ├── functions/
-    │   │   │   ├── __init__.py
     │   │   │   └── model_optimization.py
     │   │   ├── scripts/
     │   │   │   ├── substitutions.sh                  A
     │   │   │   ├── indels.sh                         A
     │   │   │   ├── peptides.sh                       A
-    │   │   │   ├── run_aggregate.sh                  A
     │   │   │   ├── foundations_substitutions.sh      B
     │   │   │   ├── foundations_indels.sh             B
-    │   │   │   ├── foundations_peptides.sh           B
-    │   │   │   └── run_aggregate_foundations.sh      B
+    │   │   │   └── foundations_peptides.sh           B
     │   │   └── simulation_output/                  created by the runs
     │   │       ├── {substitutions,indels,peptides}/                A
     │   │       └── foundations/{substitutions,indels,peptides}/    B
@@ -145,7 +146,7 @@ project-root/
     │   │
     │   ├── statistics/
     │   │   ├── model_comparison.py                vendored Polaris code
-    │   │   ├── model_comparison_README.md
+    │   │   ├── model_comparison README.md
     │   │   ├── substitutions.ipynb                   A
     │   │   ├── indels.ipynb                          A
     │   │   ├── peptides.ipynb                        A
@@ -160,16 +161,13 @@ project-root/
     │   ├── simulation.ipynb
     │   ├── seed_variance_analysis.ipynb           appendix seed-variance figure
     │   ├── rebuild_df_all.py                      rebuild df_all.csv from runs/
-    │   ├── replace_hemopi2.py                     swap in the HemoPI2 minimize rerun
     │   ├── functions/
-    │   │   ├── __init__.py
     │   │   ├── representations.py                 shared, identical copy
     │   │   └── model_optimization.py
     │   ├── scripts/
     │   │   ├── simulation_per_seed.sh             the main array (all datasets)
-    │   │   ├── rerun_hemopi2_minimize.sh          HemoPI2 only, minimize
-    │   │   ├── replace_hemopi2.sh                 merge the HemoPI2 rerun into runs/
-    │   │   └── rebuild_df_all.sh                  runs/ -> df_all.csv
+    │   │   ├── rebuild_df_all.sh                  runs/ -> df_all.csv
+    │   │   └── migrate_df_all.py                  one-off: split a legacy df_all.csv into runs/
     │   └── simulation_results/                    created by the runs
     │       ├── df_all.csv                         combined file (legacy / rebuilt)
     │       └── runs/                              one CSV per (dataset, rep, strategy, seed)
@@ -179,7 +177,6 @@ project-root/
         ├── aggregate_simulation_results.py
         ├── selecting_workflow_eval.ipynb
         ├── functions/
-        │   ├── __init__.py
         │   ├── representations.py                 shared, identical copy
         │   └── model_optimization.py
         ├── scripts/
@@ -197,8 +194,11 @@ Three things to note about the layout:
   copies must stay identical or the pipelines stop computing the same features.
   (`simulate_experiments` keeps its own copy of the same logic inside
   `model_optimization.py`.)
-* **`functions/__init__.py` must exist** in each `functions/` folder, since the
-  code imports `functions.model_optimization`.
+* **The code imports `functions.model_optimization`** (and `functions.representations`),
+  so each script `cd`s to its own module root first and `functions/` is picked up as
+  a package from there. The folders have no `__init__.py`; Python 3 treats them as
+  implicit namespace packages, so the imports resolve as long as you run from the
+  module root the way the scripts and the README do.
 * **Where the notebooks look for results.** The SLURM jobs write to
   `simulate_experiments/simulation_output/`. The statistics and visualization
   notebooks find that folder themselves — `find_results_root()` at the top of
@@ -222,10 +222,17 @@ Three things to note about the layout:
 
 ### Environment
 
-Build the environment from *requirements.txt* and wrap it in the Apptainer image
-the jobs run in, `env.sif` at the project root. Beyond the usual scientific
-stack (`pandas`, `numpy`, `scikit-learn`, `scipy`, `optuna`, `matplotlib`,
-`seaborn`) the pipelines need:
+Two ways to build the environment, both from files at the project root:
+
+* **Conda** — `conda env create -f environment.yml`, for running the notebooks
+  and scripts directly.
+* **Apptainer** — build the image the SLURM jobs run in from the recipe
+  `env.def` (which installs *requirements.txt*): `apptainer build env.sif env.def`.
+  The resulting `env.sif` is what every `.sh` script points at; it is large and
+  is not committed, so build it once on the cluster.
+
+Beyond the usual scientific stack (`pandas`, `numpy`, `scikit-learn`, `scipy`,
+`optuna`, `matplotlib`, `seaborn`) the pipelines need:
 
 | Package | Used by |
 | --- | --- |
@@ -260,7 +267,8 @@ first.** `#SBATCH -o logs/...` resolves relative to the directory you run
 the job dies before printing anything:
 
 ```bash
-mkdir -p code/benchmark/simulate_experiments/scripts/logs
+mkdir -p code/benchmark/simulate_experiments/scripts/logs   # the per-family A/B arrays
+mkdir -p code/benchmark/simulate_experiments/logs           # run_aggregate[_foundations].sh (submitted from here)
 mkdir -p code/workflow_simulation/scripts/logs
 mkdir -p code/selection_analysis/scripts/logs
 mkdir -p code/setup/logs
@@ -458,7 +466,9 @@ for m in esm2_t6_8M_UR50D esm2_t12_35M_UR50D esm2_t30_150M_UR50D esm2_t33_650M_U
     sbatch foundations_peptides.sh      $m   # array 0-279
 done
 
-# once a family's four arrays have finished
+# once a family's four arrays have finished, submit the aggregation from the
+# module root (one level up from scripts/, where run_aggregate_foundations.sh lives)
+cd ..
 sbatch run_aggregate_foundations.sh substitutions
 sbatch run_aggregate_foundations.sh indels
 sbatch run_aggregate_foundations.sh peptides
@@ -521,7 +531,9 @@ for rep in physchem morgan ngram; do
     sbatch peptides.sh      $rep     # array 0-279
 done
 
-# when those finish (4 140 tasks total)
+# when those finish (4 140 tasks total), submit the aggregation from the module
+# root (one level up from scripts/, where run_aggregate.sh lives)
+cd ..
 sbatch run_aggregate.sh substitutions
 sbatch run_aggregate.sh indels
 sbatch run_aggregate.sh peptides
@@ -549,6 +561,7 @@ for rep in esm physchem morgan ngram; do
     sbatch peptides.sh      $rep
 done
 
+cd ..   # run_aggregate.sh lives in the module root, not scripts/
 REUSE_ESM=0 sbatch run_aggregate.sh substitutions   # and indels, peptides
 ```
 
@@ -643,22 +656,12 @@ to what the notebooks consume. The notebooks themselves keep reading both
 `df_all.csv` and `runs/`, so this step is for producing the standalone file, not
 required for the notebooks to work.
 
-### HemoPI2 minimize rerun (patching an existing results set)
+### HemoPI2 direction
 
-If a results set was produced before HemoPI2 was switched to `minimize`, it can
-be corrected without rerunning every dataset:
-
-```bash
-cd code/workflow_simulation/scripts
-mkdir -p logs
-sbatch rerun_hemopi2_minimize.sh    # HemoPI2 only, all reps x both strategies, minimize
-sbatch replace_hemopi2.sh           # remove old HemoPI2 run files, copy in the new ones
-sbatch rebuild_df_all.sh            # regenerate the combined df_all.csv
-```
-
-`replace_hemopi2.sh` also strips any old HemoPI2 rows from a legacy `df_all.csv`,
-so `load_results()` returns only the corrected (minimize) HemoPI2. Every other
-dataset is left untouched. Set `DRY_RUN=1` before `replace_hemopi2.sh` to preview.
+No extra step is needed for HemoPI2. `simulation_per_seed.sh` already passes
+`--direction minimize` for HemoPI2 and `--direction maximize` for every other
+dataset (see the `directions` array in that script), so a run from scratch
+produces the correct HemoPI2 result directly.
 
 ### Stage 4
 

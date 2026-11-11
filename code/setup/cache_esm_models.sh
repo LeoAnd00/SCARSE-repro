@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -A Berzelius-2026-62
+#SBATCH -A Berzelius-2026-299
 #SBATCH -t 02:00:00
 #SBATCH --partition=berzelius-cpu
 #SBATCH --ntasks=1
@@ -12,14 +12,20 @@
 # script can help. Submit from this folder after a one-off `mkdir -p logs`, or
 # the job dies before printing anything.
 
-# Download every ESM2 checkpoint into the shared HuggingFace cache, ONCE,
-# before submitting any job array.
+# Download the foundation-model checkpoints into the shared HuggingFace cache,
+# ONCE, before submitting any job array. By default this caches the four ESM2
+# checkpoints only. To also cache PepBERT (needed for --representation pepbert),
+# pass --with_pepbert; every argument is forwarded to cache_esm_models.py.
 #
-# Easiest is to run it straight on a login node, which definitely has internet:
-#     bash cache_esm_models.sh
+# Easiest is to run it straight on a login node, which definitely has internet
+# (recommended, especially for PepBERT, since compute nodes may be offline):
+#     bash cache_esm_models.sh                  # ESM2 only
+#     bash cache_esm_models.sh --with_pepbert   # ESM2 + PepBERT
+#     bash cache_esm_models.sh --pepbert_only   # PepBERT only (ESM2 already cached)
 #
-# Or submit it and wait for it to finish before submitting anything else:
-#     mkdir -p logs && sbatch cache_esm_models.sh
+# Or submit it and wait for it to finish before submitting anything else
+# (the compute node must have outbound internet for the download to work):
+#     mkdir -p logs && sbatch cache_esm_models.sh --with_pepbert
 #
 # Every run script afterwards sets HF_HUB_OFFLINE=1, so no array task ever
 # contacts huggingface.co. Without this step, thousands of tasks starting at
@@ -53,7 +59,8 @@ export HF_DATASETS_CACHE="$HF_HOME"
 mkdir -p "$HF_HOME"
 
 echo ">> HF_HOME = $HF_HOME"
-echo ">> Downloading the four ESM2 checkpoints (about 3.2 GB in total)"
+echo ">> Caching foundation models (args: ${*:-<none> = four ESM2 checkpoints, ~3.2 GB})"
+echo ">> Pass --with_pepbert to also cache PepBERT."
 
 if [ -x "$(command -v apptainer)" ] && [ -f "$CONTAINER" ]; then
     apptainer exec "$CONTAINER" python cache_esm_models.py "$@"

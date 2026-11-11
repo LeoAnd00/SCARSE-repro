@@ -43,9 +43,10 @@ engineering workflows.
 8. [Benchmark A — representations](#benchmark-a--does-esm-2-beat-the-three-baselines)
 9. [Benchmark C — active learning](#benchmark-c--active-learning-workflow-simulations)
 10. [Benchmark D — CV score vs end-point performance](#benchmark-d--cv-score-vs-end-point-performance)
-11. [Dependencies between stages](#dependencies-between-stages)
-12. [Compute](#compute)
-13. [Citation](#citation)
+11. [Analysis — supporting analyses and publication figures](#analysis--supporting-analyses-and-publication-figures)
+12. [Dependencies between stages](#dependencies-between-stages)
+13. [Compute](#compute)
+14. [Citation](#citation)
 
 ---
 
@@ -114,8 +115,20 @@ project-root/
 │
 └── code/
     ├── setup/
-    │   ├── cache_esm_models.py                    stage 0
-    │   └── cache_esm_models.sh
+    │   ├── cache_esm_models.py                    stage 0 (ESM-2 + PepBERT caching)
+    │   ├── cache_esm_models.sh
+    │   └── test_pepbert.py                        one-off PepBERT load smoke test
+    │
+    ├── analysis/                                  supporting analyses + publication figures
+    │   ├── analysis_common.py                     shared loaders / peptide properties
+    │   ├── landscape_ruggedness.ipynb             AMP ruggedness / label censoring
+    │   ├── benchmark_seed_variance.ipynb          Fig. 2 error-bar seed variance
+    │   ├── embedding_geometry.ipynb               why SCARSE wins where it wins (GPU)
+    │   ├── interpretability.ipynb                 ESM-2 space interpretability (GPU)
+    │   ├── diversity_entropy_analysis.ipynb       seed / batch diversity vs AL outcome
+    │   ├── compute_cost.ipynb                     runtime per training size
+    │   ├── publication_figures.ipynb              rebuilds the article figures (no GPU)
+    │   └── figures/                               cached CSVs / PNGs read by the figures
     │
     ├── benchmark/
     │   ├── process_data/
@@ -170,7 +183,8 @@ project-root/
     │   │   └── migrate_df_all.py                  one-off: split a legacy df_all.csv into runs/
     │   └── simulation_results/                    created by the runs
     │       ├── df_all.csv                         combined file (legacy / rebuilt)
-    │       └── runs/                              one CSV per (dataset, rep, strategy, seed)
+    │       ├── runs/                              one CSV per (dataset, rep, strategy, seed)
+    │       └── sequences/                         acquisition record: every acquired sequence + round
     │
     └── selection_analysis/                        benchmark D
         ├── optimize_models.py
@@ -350,10 +364,25 @@ Useful variants:
 ```bash
 python cache_esm_models.py --only 650M     # just the one the main benchmarks use
 python cache_esm_models.py --verify_only   # check an existing cache
+python cache_esm_models.py --with_pepbert  # ESM-2 checkpoints AND PepBERT
+python cache_esm_models.py --pepbert_only  # only PepBERT (if ESM is already cached)
 ```
 
 If you are only running the three baselines, you can skip this step entirely —
 `physchem`, `morgan` and `ngram` never load a model.
+
+**PepBERT.** To run the `pepbert` arm you must cache PepBERT too
+(`--with_pepbert` or `--pepbert_only`). PepBERT ships custom code and a raw
+checkpoint, so the download includes `*.py` and `*.pt` as well. After caching,
+run the one-off smoke test once on a GPU node to confirm it loads and embeds
+before launching the sweep:
+
+```bash
+cd code/workflow_simulation          # any project dir with a functions/ package
+apptainer exec "$CONTAINER" python ../setup/test_pepbert.py
+```
+
+A `PASSED` here means every `--representation pepbert` job will work.
 
 ---
 
@@ -428,15 +457,25 @@ Splits are plotted but not written to disk unless `SAVE_SPLITS = True`.
 
 ## Sequence representations
 
-Every benchmark compares the same four representations, selected with
+Every benchmark compares the same representations, selected with
 `--representation` and passed to each `.sh` script as its first argument.
 
 | `--representation` | Features | Notes |
 | --- | --- | --- |
 | `esm` | 1280 | mean-pooled ESM-2 650M embeddings |
+| `pepbert` | varies | mean-pooled PepBERT embeddings (peptide-specific language model) |
 | `physchem` | 36 | modlAMP global descriptors + amino acid composition + HeliQuest-inspired features |
 | `morgan` | 2048 | RDKit peptide molecule → circular fingerprint |
 | `ngram` | varies | TF-IDF character n-grams, vocabulary fit on training data only |
+
+`pepbert` uses the peptide-specific language model PepBERT (Dai et al., bioRxiv
+2025, [doi:10.1101/2025.04.08.647838](https://doi.org/10.1101/2025.04.08.647838)),
+large UniParc variant (`dzjxzyd/PepBERT-large-UniParc`). It was added to test
+whether a peptide-trained LM helps on the short AMP datasets where ESM-2 (trained
+on full-length proteins) is weakest. PepBERT does not ship as a transformers
+`AutoModel`; it is loaded through its own custom loader (dimensions read from the
+repo's config so they always match the checkpoint). It must be cached first — see
+stage 0 — and is embedded far faster than ESM-2 since it is a ~5M-parameter model.
 
 The n-gram vocabulary is fit on the **training** sequences alone and applied
 unchanged to everything else. In the active-learning loop the training set grows
@@ -524,15 +563,18 @@ whose dataset composition would change from point to point.
 ```bash
 cd code/benchmark/simulate_experiments/scripts
 
-# Only the three baselines: esm comes from benchmark B.
-for rep in physchem morgan ngram; do
+# The three baselines plus pepbert. esm comes from benchmark B (reused).
+# pepbert is a new foundation model with no benchmark-B equivalent, so it is
+# submitted here like a baseline arm. Cache PepBERT first (stage 0 --with_pepbert).
+for rep in physchem morgan ngram pepbert; do
     sbatch substitutions.sh $rep     # array 0-699
     sbatch indels.sh        $rep     # array 0-399
     sbatch peptides.sh      $rep     # array 0-279
 done
 
-# when those finish (4 140 tasks total), submit the aggregation from the module
-# root (one level up from scripts/, where run_aggregate.sh lives)
+# when those finish (5 520 tasks total), submit the aggregation from the module
+# root (one level up from scripts/, where run_aggregate.sh lives). Aggregation
+# auto-discovers the pepbert tag alongside the baselines and reused esm.
 cd ..
 sbatch run_aggregate.sh substitutions
 sbatch run_aggregate.sh indels
@@ -597,26 +639,47 @@ Each run writes its own CSV to `simulation_results/runs/`, one file per
 replace its earlier one. To produce a single combined `df_all.csv` for a fresh
 checkout, run `scripts/rebuild_df_all.sh` after the array finishes.
 
-Two candidate selection strategies are simulated per round of 20 peptides,
+Three candidate selection strategies are simulated per round of 20 peptides,
 passed as the second argument:
 
 | Strategy | Batch composition | Idea |
 | --- | --- | --- |
-| `greedy` | 20 highest-predicted | Exploit the model's current ranking |
+| `greedy` | 20 highest-predicted | Exploit the model's current ranking. Equivalent to UCB with `beta=0`. |
 | `mixed` | 14 highest- + 6 lowest-predicted | Spend 30% of the budget on the region the model likes least, which labels the part of the space the model is most likely to be wrong about |
+| `ucb` | 20 highest `mu + beta*sigma` | Upper Confidence Bound: uncertainty-aware, using the GPR posterior standard deviation `sigma`. `beta` (default 1.0, set as `BETA` in the script) trades exploitation against exploration. |
+
+`ucb` was added so the paper compares the greedy top-k against an established,
+uncertainty-aware acquisition function. Because `greedy` is exactly UCB with
+`beta=0`, the two sit on one continuum.
 
 ### Stage 2
 
 ```bash
 cd code/workflow_simulation/scripts
 
-for rep in esm physchem morgan ngram; do
-    for acq in greedy mixed; do
+for rep in esm pepbert physchem morgan ngram; do
+    for acq in greedy mixed ucb; do
         sbatch simulation_per_seed.sh $rep $acq   # array 0-139
     done
 done
-# -> simulation_results/runs/*.csv               (1 120 tasks total)
+# -> simulation_results/runs/*.csv               (15 representations x strategies)
 ```
+
+Each run also logs, as extra `Metric` rows in the same long-format output:
+`Initial Seed Shannon Entropy` and `Initial Seed Mean Levenshtein` (diversity of
+the starting 20-peptide pool, once per dataset/seed), and `Batch Mean
+Levenshtein` and `Batch Embedding Variance` (diversity of each acquired batch).
+These feed the diversity/entropy analysis in `code/analysis/`.
+
+**Full acquisition record.** Alongside `runs/`, each run writes a CSV to
+`simulation_results/sequences/` (same per-run file naming) listing *every*
+sequence that entered the training set, with the round it was acquired in
+(`round` 0 = the initial seed), its rank within that batch (`acq_rank`, 0 = top
+pick), the training-set size after it was added, and its score. This makes the
+entire acquisition trajectory — which sequences, in which order — recoverable
+for any later sequence-level analysis without re-running the simulation. The
+`sequences/` folder is independent of the metrics: `load_results()` and
+`rebuild_df_all.py` read only `runs/`, so it never affects the figures.
 
 `simulation_per_seed.sh` carries a per-dataset optimisation direction: every
 dataset uses `--direction maximize` except HemoPI2, which uses
@@ -738,6 +801,28 @@ for each strategy.
 
 ---
 
+## Analysis — supporting analyses and publication figures
+
+`code/analysis/` holds a set of standalone notebooks that go beyond the four
+headline benchmarks: they probe *why* the results look the way they do, quantify
+the robustness and cost of the method, and regenerate the article-ready figures.
+They all read the outputs the benchmarks already produced (plus the processed
+data), so they run after stages 2–4 and never re-run a sweep. Shared loaders and
+peptide-property helpers live in `analysis_common.py`; each notebook prints the
+results root it picked up.
+
+| Notebook | Question | Reads | GPU |
+| --- | --- | --- | --- |
+| `landscape_ruggedness.ipynb` | Is the lower AMP R² due to uninformative embeddings or an intrinsically hard, rugged/censored fitness landscape? Relates pairwise sequence distance to pairwise target difference and checks for label censoring. | processed data | no |
+| `benchmark_seed_variance.ipynb` | Do the large Fig. 2 AMP error bars at small training sizes reflect genuine sensitivity to the initial data draw or evaluation noise? Reports the across-seed SD of Test R² per dataset and training size. | `simulation_summary*.csv` (A/B) | no |
+| `embedding_geometry.ipynb` | Why does the SCARSE-vs-baseline gap vary across datasets? Compares the representation spaces on spread and on how well distance tracks target difference. | processed data | no |
+| `interpretability.ipynb` | Does the ESM-2 space capture biologically meaningful structure rather than acting as a black box? UMAP of the space coloured by physicochemical properties, plus feature–target correlations. | processed data | no |
+| `diversity_entropy_analysis.ipynb` | Do more diverse initial seeds help, and how diverse are the batches each acquisition strategy picks? Uses the seed/batch diversity metrics logged during the AL runs, across greedy / mixed / UCB. | `df_all.csv` / `runs/` (C) | no |
+| `compute_cost.ipynb` | How long does a run take and how does it scale with training size? Collects every `timing.csv` and reports runtime per training size, aggregated across the 24 benchmark datasets. | `timing.csv` from the runs | no |
+| `publication_figures.ipynb` | Regenerates the three article-ready figures in one place, reading the caches the GPU notebooks wrote to `figures/`. Missing caches are skipped with a note. | `figures/` caches + processed data | no |
+
+---
+
 ## Dependencies between stages
 
 * **B runs before A**: A's aggregation reads B's 650M results as its `esm` arm.
@@ -746,19 +831,23 @@ for each strategy.
 * D's stage 4 needs C's results (read from `runs/` plus any `df_all.csv` via
   `load_results()`).
 * Within A and B, the statistics notebooks must run before the visualizations.
+* The `analysis/` notebooks run last: each reads outputs from stages 2–4, so
+  run them after the relevant benchmark has finished.
 
 ## Compute
 
 | Benchmark | Tasks per submission | Submissions | Total |
 | --- | --- | --- | --- |
-| A. Representations | 700 + 400 + 280 = 1 380 | 3 baselines (esm reused from B) | 4 140 |
+| A. Representations | 700 + 400 + 280 = 1 380 | 3 baselines + pepbert (esm reused from B) | 5 520 |
 | B. Foundation models | 700 + 400 + 280 = 1 380 | 4 checkpoints | 5 520 |
-| C. Active learning | 140 | 4 representations × 2 strategies | 1 120 |
+| C. Active learning | 140 | 5 representations × 3 strategies | 2 100 |
 | D. Selection analysis | 900 + 360 = 1 260 | 4 representations | 5 040 |
 
 Array sizes are all kept under 1 000, the usual SLURM `MaxArraySize`. That is
 why the representation and the checkpoint are passed as arguments rather than
 folded into the array index, and why D is split into two scripts.
+
+---
 
 ## Citation
 

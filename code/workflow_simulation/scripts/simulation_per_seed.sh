@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -A Berzelius-2026-62
+#SBATCH -A Berzelius-2026-299
 #SBATCH -t 48:00:00
 #SBATCH --partition=berzelius-cpu
 #SBATCH --ntasks=1
@@ -19,22 +19,28 @@
 # first and second arguments:
 #   sbatch simulation_per_seed.sh esm greedy
 #   sbatch simulation_per_seed.sh esm mixed
+#   sbatch simulation_per_seed.sh esm ucb
+#   sbatch simulation_per_seed.sh pepbert greedy
 #   sbatch simulation_per_seed.sh physchem greedy
-#   ... (4 representations x 2 strategies = 8 submissions)
+#   ... (5 representations x 3 strategies = 15 submissions)
 #
 # The strategies are:
 #   greedy - acquire the 20 highest-predicted sequences each round
 #   mixed  - acquire 14 highest-predicted + 6 lowest-predicted each round
 #            (70/30, set by --explore_frac below), a more exploratory approach
+#   ucb    - rank by mu + beta*sigma (GPR posterior std) and take the top 20;
+#            an uncertainty-aware strategy. greedy == ucb with beta=0.
 #
 # Or queue them all one after another:
 #   jid=""
-#   for rep in esm physchem morgan ngram; do
-#     for acq in greedy mixed; do
+#   for rep in esm pepbert physchem morgan ngram; do
+#     for acq in greedy mixed ucb; do
 #       dep=""; [ -n "$jid" ] && dep="--dependency=afterok:$jid"
 #       jid=$(sbatch $dep simulation_per_seed.sh $rep $acq | awk '{print $4}')
 #     done
 #   done
+#
+# PepBERT must be cached first (code/setup/cache_esm_models.sh --with_pepbert).
 #
 # Every submission appends to the same simulation_results/df_all.csv, tagged by
 # the "Representation" and "Acquisition" columns.
@@ -85,19 +91,24 @@ export PYTHONUNBUFFERED=1
 # ------------------------------------
 REPRESENTATION=${1:-esm}
 case "$REPRESENTATION" in
-    esm|physchem|morgan|ngram) ;;
-    *) echo "Unknown representation: $REPRESENTATION (expected esm, physchem, morgan or ngram)"; exit 1 ;;
+    esm|pepbert|physchem|morgan|ngram) ;;
+    *) echo "Unknown representation: $REPRESENTATION (expected esm, pepbert, physchem, morgan or ngram)"; exit 1 ;;
 esac
 
 ACQUISITION=${2:-greedy}
 case "$ACQUISITION" in
-    greedy|mixed) ;;
-    *) echo "Unknown acquisition strategy: $ACQUISITION (expected greedy or mixed)"; exit 1 ;;
+    greedy|mixed|ucb) ;;
+    *) echo "Unknown acquisition strategy: $ACQUISITION (expected greedy, mixed or ucb)"; exit 1 ;;
 esac
 
 # Fraction of each batch taken from the lowest-predicted sequences when
 # ACQUISITION=mixed. 0.3 of a 20-peptide batch is 14 best + 6 worst.
 EXPLORE_FRAC=0.3
+
+# UCB exploration weight when ACQUISITION=ucb: candidates are ranked by
+# mu + BETA*sigma (sigma = GPR posterior std). BETA=0 reduces UCB to greedy;
+# 1.0 is a standard, moderately exploratory default. Ignored for greedy/mixed.
+BETA=1.0
 
 # Run-time limits for the GPR hyperparameter search (seconds, 0 = no limit).
 # TRIAL_TIMEOUT: one Optuna trial (all CV folds); a trial over the limit is
@@ -200,8 +211,10 @@ DIRECTION="${directions[$DATASET_IDX]}"
 echo "Representation ${REPRESENTATION}"
 if [ "$ACQUISITION" = "mixed" ]; then
     echo "Acquisition ${ACQUISITION} (explore_frac ${EXPLORE_FRAC})"
+elif [ "$ACQUISITION" = "ucb" ]; then
+    echo "Acquisition ${ACQUISITION} (mu + beta*sigma, beta ${BETA})"
 else
-    echo "Acquisition ${ACQUISITION} (top-k only; explore_frac does not apply)"
+    echo "Acquisition ${ACQUISITION} (top-k only; explore_frac/beta do not apply)"
 fi
 echo "Running dataset ${DATASET_NAME}"
 echo "Using data file ${DATA_PATH}"
@@ -219,6 +232,7 @@ python simulation.py \
   --acquisition "${ACQUISITION}" \
   --direction "${DIRECTION}" \
   --explore_frac ${EXPLORE_FRAC} \
+  --beta ${BETA} \
   --model_name "facebook/esm2_t33_650M_UR50D" \
   --max_num_samp 200 \
   --new_samp_per_step 20 \

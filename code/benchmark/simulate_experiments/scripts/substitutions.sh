@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -A Berzelius-2026-62
+#SBATCH -A Berzelius-2026-299
 #SBATCH -t 48:00:00
 #SBATCH --partition=berzelius-cpu
 #SBATCH --ntasks=1
@@ -78,8 +78,8 @@ export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}
 # ------------------------
 REPRESENTATION=${1:-esm}
 case "$REPRESENTATION" in
-    esm|physchem|morgan|ngram) ;;
-    *) echo "Unknown representation: $REPRESENTATION (expected esm, physchem, morgan or ngram)"; exit 1 ;;
+    esm|pepbert|physchem|morgan|ngram) ;;
+    *) echo "Unknown representation: $REPRESENTATION (expected esm, pepbert, physchem, morgan or ngram)"; exit 1 ;;
 esac
 
 # ------------------------

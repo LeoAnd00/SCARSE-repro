@@ -41,34 +41,52 @@ from sklearn.gaussian_process.kernels import (
 from sklearn.metrics import mean_squared_error
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
+from Levenshtein import distance as levenshtein_distance
 
 from functions.representations import SequenceRepresenter, REPRESENTATIONS
+
+#: The 20 standard amino acids, used for sequence Shannon entropy.
+AMINO_ACIDS = "ACDEFGHIKLMNPQRSTVWY"
 
 
 #: Display labels for each representation, used by the figures.
 REPRESENTATION_LABELS = {
     "esm":      "GPR + ESM2",
+    "pepbert":  "GPR + PepBERT",
     "physchem": "GPR + Physchem",
     "morgan":   "GPR + Morgan",
     "ngram":    "GPR + N-gram",
 }
 
 #: Candidate selection strategies.
-#:   greedy - acquire the `new_samp_per_step` highest-predicted sequences
+#:   greedy - acquire the `new_samp_per_step` highest-predicted sequences.
+#:            This is exactly UCB with beta = 0 (pure exploitation).
 #:   mixed  - acquire (1 - explore_frac) of the batch from the highest-predicted
 #:            and explore_frac from the *lowest*-predicted, which deliberately
-#:            spends part of the budget on the model's least favourite region
-ACQUISITION_STRATEGIES = ("greedy", "mixed")
+#:            spends part of the budget on the model's least favourite region.
+#:   ucb    - Upper Confidence Bound: rank by mu + beta * sigma, where sigma is
+#:            the GPR posterior standard deviation, and take the top-k. beta
+#:            trades exploitation (0) against exploration (larger). An
+#:            uncertainty-aware acquisition that uses the full GP posterior.
+ACQUISITION_STRATEGIES = ("greedy", "mixed", "ucb")
+
+#: Strategies that need the model's predictive standard deviation.
+UNCERTAINTY_STRATEGIES = ("ucb",)
+
+#: Default UCB exploration weight.
+DEFAULT_UCB_BETA = 1.0
 
 #: Line style per strategy, so a figure can show colour = representation and
 #: style = strategy.
-ACQUISITION_LINESTYLES = {"greedy": "-", "mixed": "--"}
+ACQUISITION_LINESTYLES = {"greedy": "-", "mixed": "--", "ucb": ":"}
 
 
-def acquisition_label(strategy, explore_frac):
-    """Human-readable strategy name, derived so it follows explore_frac."""
+def acquisition_label(strategy, explore_frac, beta=DEFAULT_UCB_BETA):
+    """Human-readable strategy name, derived so it follows explore_frac/beta."""
     if strategy == "greedy":
         return "Greedy (top-k)"
+    if strategy == "ucb":
+        return f"UCB (beta={beta:g})"
     pct = int(round(explore_frac * 100))
     return f"Mixed ({100 - pct}% best / {pct}% worst)"
 
@@ -128,6 +146,15 @@ RESULT_ID_COLUMNS = ["Dataset", "Seed", "Num_samples", "Metric",
 
 #: Sub-folder of the results directory holding one CSV per array task.
 RUNS_SUBDIR = "runs"
+
+#: Sub-folder holding the per-run acquisition record: every sequence that
+#: entered the training set, with the round it was acquired in. This lets any
+#: later sequence-level analysis be done without re-running the simulation.
+SEQ_SUBDIR = "sequences"
+
+#: Columns of the per-run sequence/acquisition record.
+SEQ_COLUMNS = ["Dataset", "Seed", "Representation", "Acquisition",
+               "round", "acq_rank", "num_samples_after", "sequence", "score"]
 
 
 def run_file_name(dataset, representation, acquisition, seed):
@@ -513,23 +540,101 @@ class ModelOptimization:
 
         return best_model, y_train, y_test
 
+    # ------------------------------------------------------------------
+    # Diversity and entropy of a sequence set
+    # ------------------------------------------------------------------
     @staticmethod
-    def select_candidates(pred_scores, n_select, strategy="greedy", explore_frac=0.3):
+    def sequence_shannon_entropy(sequences):
+        """Shannon entropy (bits) of the pooled amino-acid composition.
+
+        All residues across ``sequences`` are pooled, the frequency of each of
+        the 20 standard amino acids is taken, and the Shannon entropy of that
+        distribution is returned. High entropy = the set samples many amino
+        acids evenly (compositionally diverse); low entropy = a few residues
+        dominate. Non-standard residues are ignored. Returns ``nan`` for an
+        empty set.
+
+        This is the "sequence diversity" quantity Reviewer 2 suggested relating
+        to active-learning success.
+        """
+        counts = np.zeros(len(AMINO_ACIDS), dtype=float)
+        index = {aa: i for i, aa in enumerate(AMINO_ACIDS)}
+        for seq in sequences:
+            for aa in str(seq).upper():
+                j = index.get(aa)
+                if j is not None:
+                    counts[j] += 1.0
+        total = counts.sum()
+        if total == 0:
+            return float("nan")
+        p = counts[counts > 0] / total
+        return float(-(p * np.log2(p)).sum())
+
+    @staticmethod
+    def mean_pairwise_levenshtein(sequences, normalized=True):
+        """Mean pairwise (optionally length-normalised) Levenshtein distance.
+
+        A length-robust sequence-diversity measure for a batch, used instead of
+        Hamming distance because the peptides are not equal length. With
+        ``normalized=True`` each distance is divided by the longer of the two
+        sequences, giving a value in [0, 1]. Returns ``nan`` for fewer than two
+        sequences.
+        """
+        seqs = [str(s) for s in sequences]
+        n = len(seqs)
+        if n < 2:
+            return float("nan")
+        total = 0.0
+        pairs = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = levenshtein_distance(seqs[i], seqs[j])
+                if normalized:
+                    denom = max(len(seqs[i]), len(seqs[j]))
+                    d = d / denom if denom > 0 else 0.0
+                total += d
+                pairs += 1
+        return float(total / pairs) if pairs else float("nan")
+
+    @staticmethod
+    def embedding_space_variance(embeddings):
+        """Mean per-dimension variance of a set of embedding vectors.
+
+        A representation-space spread measure for a batch: the variance of each
+        feature across the batch, averaged over features. Equal to the mean
+        squared Euclidean distance to the centroid divided by the dimension, so
+        it is comparable across representations of different width. Returns
+        ``nan`` for fewer than two vectors.
+        """
+        X = np.asarray(embeddings, dtype=float)
+        if X.ndim != 2 or X.shape[0] < 2:
+            return float("nan")
+        return float(X.var(axis=0).mean())
+
+    @staticmethod
+    def select_candidates(pred_scores, n_select, strategy="greedy", explore_frac=0.3,
+                          pred_std=None, beta=DEFAULT_UCB_BETA):
         """Indices of the sequences to acquire from the remaining pool.
 
         Parameters
         ----------
         pred_scores : array
-            Predicted score for every sequence still in the pool.
+            Predicted mean score for every sequence still in the pool.
         n_select : int
             Batch size. Clipped to the pool size on the final rounds.
-        strategy : {"greedy", "mixed"}
+        strategy : {"greedy", "mixed", "ucb"}
             ``greedy`` takes the n_select highest-predicted sequences.
             ``mixed`` takes ``round(explore_frac * n_select)`` from the
             lowest-predicted and the rest from the highest-predicted.
+            ``ucb`` ranks by ``pred_scores + beta * pred_std`` and takes the
+            top-k. ``greedy`` is the special case ``ucb`` with ``beta = 0``.
         explore_frac : float
-            Fraction of the batch drawn from the predicted worst. Ignored for
-            ``greedy``.
+            Fraction of the batch drawn from the predicted worst. ``mixed`` only.
+        pred_std : array, optional
+            Posterior standard deviation per pool sequence. Required for
+            ``ucb``; ignored otherwise.
+        beta : float
+            UCB exploration weight. ``ucb`` only.
 
         Returns
         -------
@@ -545,6 +650,13 @@ class ModelOptimization:
         n_select = int(min(n_select, pool))
         if n_select <= 0:
             return np.array([], dtype=int)
+
+        if strategy == "ucb":
+            if pred_std is None:
+                raise ValueError("ucb acquisition requires pred_std.")
+            acq = np.asarray(pred_scores, dtype=float) + beta * np.asarray(pred_std, dtype=float)
+            order = np.argsort(acq)
+            return order[-n_select:][::-1]
 
         order = np.argsort(pred_scores)
 
@@ -570,8 +682,24 @@ class ModelOptimization:
         _, first = np.unique(selected, return_index=True)
         return selected[np.sort(first)]
 
-    def pred(self, train_seqs, y_train, test_seqs, label_idx, best_model, score_col):
-        """Fit the tuned model on the acquired set and score the remaining pool."""
+    def pred(self, train_seqs, y_train, test_seqs, label_idx, best_model, score_col,
+             return_std=False):
+        """Fit the tuned model on the acquired set and score the remaining pool.
+
+        Parameters
+        ----------
+        return_std : bool
+            When True, also return the GaussianProcessRegressor posterior
+            standard deviation for each pool sequence (used by UCB). If the
+            model does not support ``return_std`` (it always does here, but this
+            keeps the helper safe) a zero vector is returned, which makes UCB
+            degenerate gracefully to greedy.
+
+        Returns
+        -------
+        numpy.ndarray or tuple(numpy.ndarray, numpy.ndarray)
+            Predicted means, or ``(means, stds)`` when ``return_std=True``.
+        """
 
         # fit=True refits the n-gram vocabulary on the current training set,
         # which grows every acquisition round; the pool is then transformed
@@ -585,6 +713,16 @@ class ModelOptimization:
 
         model = clone(best_model)
         model.fit(X_train, y_train[:, label_idx])
+
+        if return_std:
+            try:
+                mu, sigma = model.predict(X_test, return_std=True)
+            except TypeError:
+                # Model without a return_std interface: fall back to zero std,
+                # so UCB behaves like greedy rather than erroring.
+                mu = model.predict(X_test)
+                sigma = np.zeros_like(mu, dtype=float)
+            return mu, sigma
 
         return model.predict(X_test)
 
@@ -603,6 +741,7 @@ class ModelOptimization:
                         representation=None,
                         acquisition="greedy",
                         explore_frac=0.3,
+                        beta=DEFAULT_UCB_BETA,
                         results_dir="./simulation_results",
                         optuna_print=True,
                         trial_timeout=None,
@@ -655,6 +794,7 @@ class ModelOptimization:
         seeds = [start_seed + i for i in range(n_seeds)]
 
         rows = []
+        seq_rows = []   # full acquisition record: one row per acquired sequence
 
         for data_idx, data_path in enumerate(data_paths):
 
@@ -675,6 +815,30 @@ class ModelOptimization:
 
                 all_selected_seqs = set(self.training_sequences)
 
+                # Diversity of the INITIAL seed set, recorded once per (dataset,
+                # seed). These are the features we correlate with the eventual
+                # active-learning outcome (R2.2: does a more diverse starting
+                # pool lead to better campaigns?). Recorded for every
+                # representation/strategy run, but the value depends only on the
+                # seed set, so it is identical across them for a given seed.
+                initial_seqs = list(self.training_sequences)
+                initial_entropy = self.sequence_shannon_entropy(initial_seqs)
+                initial_lev = self.mean_pairwise_levenshtein(initial_seqs)
+                rows.append([ds_name, seed, len(initial_seqs),
+                             "Initial Seed Shannon Entropy", initial_entropy,
+                             self.representation, acquisition])
+                rows.append([ds_name, seed, len(initial_seqs),
+                             "Initial Seed Mean Levenshtein", initial_lev,
+                             self.representation, acquisition])
+
+                # Record the initial seed set (round 0) in the acquisition log,
+                # so the full set of training sequences and the order they were
+                # acquired is recoverable for any later sequence-level analysis.
+                for rank, s in enumerate(initial_seqs):
+                    seq_rows.append([ds_name, seed, self.representation, acquisition,
+                                     0, rank, len(initial_seqs), s,
+                                     self.seq_to_score.get(s, np.nan)])
+
                 # Simulation
 
                 round_idx = -1
@@ -693,14 +857,22 @@ class ModelOptimization:
                         round_timeout=round_timeout,
                     )
 
-                    pred_scores = self.pred(
+                    # UCB needs the posterior std; the other strategies only
+                    # need the mean prediction.
+                    needs_std = acquisition in UNCERTAINTY_STRATEGIES
+                    pred_out = self.pred(
                         train_seqs=self.training_sequences,
                         y_train=y_train,
                         test_seqs=self.test_sequences,
                         label_idx=0,
                         best_model=best_model,
-                        score_col=score_col
+                        score_col=score_col,
+                        return_std=needs_std,
                     )
+                    if needs_std:
+                        pred_scores, pred_std = pred_out
+                    else:
+                        pred_scores, pred_std = pred_out, None
 
                     if round_idx == 0:
 
@@ -722,6 +894,8 @@ class ModelOptimization:
                         new_samp_per_step,
                         strategy=acquisition,
                         explore_frac=explore_frac,
+                        pred_std=pred_std,
+                        beta=beta,
                     )
 
                     print(f"[{ds_name} seed {seed}] round {round_idx} done in "
@@ -784,6 +958,35 @@ class ModelOptimization:
 
                     # Update new training set
                     selected_seqs = [self.test_sequences[i] for i in pred_idx]
+
+                    # Record each acquired sequence with the round it was picked
+                    # in and its rank within the batch (pred_idx is in
+                    # acquisition order, so rank 0 is the top pick). num_samples_after
+                    # is the training-set size once this batch is added.
+                    n_after = len(self.training_sequences) + len(selected_seqs)
+                    for rank, s in enumerate(selected_seqs):
+                        seq_rows.append([ds_name, seed, self.representation, acquisition,
+                                         round_idx + 1, rank, n_after, s,
+                                         self.seq_to_score.get(s, np.nan)])
+
+                    # Batch-diversity metrics for the sequences acquired THIS
+                    # round (R3.2): sequence spread via mean pairwise normalised
+                    # Levenshtein, and representation-space spread via the mean
+                    # per-dimension embedding variance. fit=False keeps the
+                    # n-gram vocabulary (fit on the training set) unchanged.
+                    batch_lev = self.mean_pairwise_levenshtein(selected_seqs)
+                    rows.append([ds_name, seed, len(self.training_sequences) + len(selected_seqs),
+                                 "Batch Mean Levenshtein", batch_lev,
+                                 self.representation, acquisition])
+                    if len(selected_seqs) >= 2:
+                        batch_emb = self.compute_embeddings(list(selected_seqs), fit=False)
+                        batch_emb_var = self.embedding_space_variance(batch_emb)
+                    else:
+                        batch_emb_var = float("nan")
+                    rows.append([ds_name, seed, len(self.training_sequences) + len(selected_seqs),
+                                 "Batch Embedding Variance", batch_emb_var,
+                                 self.representation, acquisition])
+
                     self.training_sequences.extend(selected_seqs)
 
                     # remove from test set
@@ -848,6 +1051,19 @@ class ModelOptimization:
                                           acquisition, seed)
             part.to_csv(out, index=False)
             print(f"Wrote {len(part)} rows to {out}", flush=True)
+
+        # Full acquisition record: one CSV per (dataset, representation,
+        # strategy, seed) in sequences/, same naming as runs/. This stores every
+        # training sequence and the round/rank it was acquired in, so later
+        # sequence-level analyses need no re-run.
+        seq_all = pd.DataFrame(seq_rows, columns=SEQ_COLUMNS)
+        seq_dir = Path(results_dir) / SEQ_SUBDIR
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        for (ds_name, seed), part in seq_all.groupby(["Dataset", "Seed"], sort=False):
+            out = seq_dir / run_file_name(ds_name, self.representation,
+                                          acquisition, seed)
+            part.to_csv(out, index=False)
+            print(f"Wrote {len(part)} acquisition rows to {out}", flush=True)
 
     # ------------------------------------------------------------------
     def visualize(self, dataset_names, dataset_sizes=None,

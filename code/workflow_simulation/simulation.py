@@ -3,7 +3,11 @@
 
 import argparse
 
-from functions.model_optimization import ModelOptimization, ACQUISITION_STRATEGIES
+from functions.model_optimization import (
+    ModelOptimization,
+    ACQUISITION_STRATEGIES,
+    DEFAULT_UCB_BETA,
+)
 from functions.representations import REPRESENTATIONS, NGRAM_VECTORIZERS
 
 
@@ -21,6 +25,7 @@ def run_hit_rate_simulation(
     representation,
     acquisition,
     explore_frac,
+    beta,
     score_col,
     results_dir,
     morgan_radius,
@@ -61,6 +66,7 @@ def run_hit_rate_simulation(
         representation=representation,
         acquisition=acquisition,
         explore_frac=explore_frac,
+        beta=beta,
         results_dir=results_dir,
         optuna_print=optuna_print,
         trial_timeout=trial_timeout,
@@ -104,6 +110,10 @@ def parse_args():
     parser.add_argument("--explore_frac", type=float, default=0.3,
                         help="Fraction of each batch spent on the lowest-predicted "
                              "sequences when --acquisition mixed.")
+    parser.add_argument("--beta", type=float, default=DEFAULT_UCB_BETA,
+                        help="UCB exploration weight: candidates are ranked by "
+                             "mu + beta*sigma when --acquisition ucb. beta=0 "
+                             "reduces UCB to greedy. Ignored for other strategies.")
     parser.add_argument("--morgan_radius", type=int, default=2)
     parser.add_argument("--morgan_bits", type=int, default=2048)
     parser.add_argument("--ngram_range", type=int, nargs=2, default=[1, 3],
@@ -151,6 +161,7 @@ if __name__ == "__main__":
         representation=args.representation,
         acquisition=args.acquisition,
         explore_frac=args.explore_frac,
+        beta=args.beta,
         score_col=args.score_col,
         results_dir=args.results_dir,
         morgan_radius=args.morgan_radius,

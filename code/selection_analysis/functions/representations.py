@@ -32,12 +32,24 @@ import pandas as pd
 from modlamp.descriptors import GlobalDescriptor
 from sklearn.feature_extraction.text import HashingVectorizer, TfidfVectorizer
 
-#: Representations that can be used. "esm" is the foundation model, the rest
-#: are the baselines.
-REPRESENTATIONS = ("esm", "physchem", "morgan", "ngram")
+#: Representations that can be used. "esm" and "pepbert" are foundation
+#: (protein/peptide language) models, the rest are the baselines.
+REPRESENTATIONS = ("esm", "pepbert", "physchem", "morgan", "ngram")
 
 #: Baselines, i.e. every representation that is not a foundation model.
 BASELINE_REPRESENTATIONS = ("physchem", "morgan", "ngram")
+
+#: Representations that need a GPU-capable language model loaded before use.
+FOUNDATION_REPRESENTATIONS = ("esm", "pepbert")
+
+#: Default PepBERT checkpoint. PepBERT is a peptide-specific language model
+#: (Dai et al., bioRxiv 2025, https://doi.org/10.1101/2025.04.08.647838); the
+#: large UniParc variant is the best-performing one reported there. Loaded from
+#: the Hugging Face Hub through its own custom loader (see _embed_pepbert), not
+#: via transformers AutoModel.
+PEPBERT_DEFAULT_REPO = "dzjxzyd/PepBERT-large-UniParc"
+#: Checkpoint weight file inside the PepBERT repo.
+PEPBERT_CHECKPOINT = "tmodel_17.pt"
 
 #: Ways of turning character n-grams into a fixed-width feature vector.
 NGRAM_VECTORIZERS = ("tfidf", "hashing")
@@ -87,6 +99,7 @@ class SequenceRepresenter:
         ngram_range=(1, 3),
         ngram_vectorizer="tfidf",
         ngram_features=1024,
+        pepbert_repo=PEPBERT_DEFAULT_REPO,
     ):
         if representation not in REPRESENTATIONS:
             raise ValueError(
@@ -106,22 +119,30 @@ class SequenceRepresenter:
         self.ngram_range = tuple(ngram_range)
         self.ngram_vectorizer_kind = ngram_vectorizer
         self.ngram_features = ngram_features
+        self.pepbert_repo = pepbert_repo
 
         self.model = None
         self.tokenizer = None
         self.device = None
         self._morgan_generator = None
         self.ngram_vectorizer = None
+        # PepBERT-specific handles, populated by _load_pepbert.
+        self._pepbert_sos = None
+        self._pepbert_eos = None
 
     # ------------------------------------------------------------------
     @property
     def needs_model(self):
         """Whether this representation requires loading a foundation model."""
-        return self.representation == "esm"
+        return self.representation in FOUNDATION_REPRESENTATIONS
 
     def load_model(self):
-        """Load the ESM2 model. A no-op for the baselines."""
+        """Load the foundation model (ESM2 or PepBERT). A no-op for baselines."""
         if not self.needs_model:
+            return
+
+        if self.representation == "pepbert":
+            self._load_pepbert()
             return
 
         # torch/transformers are imported here so the baselines can run in a
@@ -165,6 +186,8 @@ class SequenceRepresenter:
 
         if self.representation == "esm":
             return self._embed_esm(seqs, batch_size=batch_size)
+        if self.representation == "pepbert":
+            return self._embed_pepbert(seqs, batch_size=batch_size)
         if self.representation == "physchem":
             return self._embed_physchem(seqs)
         if self.representation == "morgan":
@@ -217,6 +240,109 @@ class SequenceRepresenter:
                 mask = attention_mask[j].bool().to(mean_layers.device)
                 seq_emb = mean_layers[j, mask].mean(dim=0)
                 embeddings.append(seq_emb.cpu().numpy())
+
+        return np.vstack(embeddings)
+
+    # ------------------------------------------------------------------
+    # PepBERT (peptide-specific language model)
+    # ------------------------------------------------------------------
+    def _load_pepbert(self):
+        """Load PepBERT from the Hugging Face Hub.
+
+        PepBERT does not ship as a transformers ``AutoModel``. The repo contains
+        a custom ``model.py`` (defining ``build_transformer``), a ``config.py``,
+        a ``tokenizers`` tokenizer (``tokenizer.json``) and a raw PyTorch
+        checkpoint. We download those, build the architecture from the repo's own
+        config so we never hard-code dimensions that could drift between
+        checkpoints, load the weights, and keep the tokenizer plus its special
+        token ids for embedding.
+
+        Reference: Dai et al., "PepBERT: Lightweight language models for
+        bioactive peptide representation", bioRxiv 2025,
+        https://doi.org/10.1101/2025.04.08.647838
+        """
+        import importlib.util
+
+        import torch
+        from huggingface_hub import hf_hub_download
+        from tokenizers import Tokenizer
+
+        torch.manual_seed(self.random_seed)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"Loading PepBERT model: {self.pepbert_repo}")
+
+        def _hub_module(filename):
+            path = hf_hub_download(repo_id=self.pepbert_repo, filename=filename)
+            spec = importlib.util.spec_from_file_location(filename[:-3], path)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+
+        model_mod = _hub_module("model.py")
+        cfg = _hub_module("config.py").get_config()
+
+        tok_path = hf_hub_download(repo_id=self.pepbert_repo, filename="tokenizer.json")
+        self.tokenizer = Tokenizer.from_file(tok_path)
+
+        # Build the architecture from the repo's own config so the embedding
+        # dimension and sequence length always match the checkpoint.
+        self.model = model_mod.build_transformer(
+            src_vocab_size=self.tokenizer.get_vocab_size(),
+            src_seq_len=cfg["seq_len"],
+            d_model=cfg["d_model"],
+        )
+        self._pepbert_seq_len = int(cfg["seq_len"])
+
+        ckpt_path = hf_hub_download(repo_id=self.pepbert_repo, filename=PEPBERT_CHECKPOINT)
+        state = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(state["model_state_dict"])
+        self.model = self.model.to(self.device)
+        self.model.eval()
+
+        self._pepbert_sos = self.tokenizer.token_to_id("[SOS]")
+        self._pepbert_eos = self.tokenizer.token_to_id("[EOS]")
+        if self._pepbert_sos is None or self._pepbert_eos is None:
+            raise RuntimeError(
+                "PepBERT tokenizer is missing the [SOS]/[EOS] special tokens; "
+                "cannot build the encoder input."
+            )
+
+        print("PepBERT model loaded. Using device:", self.device)
+
+    def _embed_pepbert(self, seqs, batch_size=None):
+        """Mean-pooled PepBERT encoder embeddings.
+
+        Each sequence is wrapped with [SOS]/[EOS], encoded, and the per-residue
+        embeddings (excluding the two special tokens) are mean-pooled, mirroring
+        the official PepBERT embedding recipe. Sequences are processed one at a
+        time with an all-ones mask, so no padding tokens enter the mean. A
+        sequence longer than the model's context is truncated to fit.
+        """
+        import torch
+
+        if self.model is None:
+            raise RuntimeError("PepBERT model not loaded. Call load_model() first.")
+
+        # The encoder context includes the two special tokens.
+        max_residues = self._pepbert_seq_len - 2
+
+        embeddings = []
+        for seq in seqs:
+            ids = self.tokenizer.encode(str(seq)).ids
+            if len(ids) > max_residues:
+                ids = ids[:max_residues]
+            ids = [self._pepbert_sos] + ids + [self._pepbert_eos]
+
+            x = torch.tensor([ids], dtype=torch.int64, device=self.device)
+            # PepBERT's encoder expects a (batch, 1, 1, seq_len) attention mask.
+            mask = torch.ones((1, 1, 1, x.size(1)), dtype=torch.int64, device=self.device)
+
+            with torch.no_grad():
+                hidden = self.model.encode(x, mask)       # (1, seq_len, d_model)
+                emb = hidden[:, 1:-1, :].mean(dim=1)       # drop [SOS]/[EOS], mean-pool
+
+            embeddings.append(emb.squeeze(0).cpu().numpy())
 
         return np.vstack(embeddings)
 

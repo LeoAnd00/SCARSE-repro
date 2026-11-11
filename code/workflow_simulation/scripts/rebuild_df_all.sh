@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH -A Berzelius-2026-62
+#SBATCH -A Berzelius-2026-299
 #SBATCH -t 00:15:00
 #SBATCH --partition=berzelius-cpu
 #SBATCH --ntasks=1

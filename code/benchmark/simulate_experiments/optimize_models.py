@@ -63,9 +63,114 @@ Files:
 """
 
 import os
+import time
+import platform
 import argparse
 import pandas as pd
 from functions.model_optimization import ModelOptimization, REPRESENTATIONS
+
+
+# Hardware description is gathered once per process and reused for every timing
+# row, so the cost (and any torch import) happens a single time.
+_HARDWARE_INFO = None
+
+
+def hardware_info():
+    """Describe the machine this run executes on, for the timing records.
+
+    Captures CPU model and core counts, total RAM, the compute device actually
+    used (cuda/cpu) and, when CUDA is available, the GPU name and memory, plus
+    the relevant SLURM allocation and thread-cap environment variables. Every
+    lookup is wrapped so a missing library or file never breaks a run; unknown
+    fields are recorded as "unknown". Cached after the first call.
+    """
+    global _HARDWARE_INFO
+    if _HARDWARE_INFO is not None:
+        return _HARDWARE_INFO
+
+    info = {
+        "hostname": "unknown",
+        "platform": "unknown",
+        "cpu_model": "unknown",
+        "cpu_count_physical": "unknown",
+        "cpu_count_logical": "unknown",
+        "ram_total_gb": "unknown",
+        "device": "cpu",
+        "gpu_name": "none",
+        "gpu_count": 0,
+        "gpu_mem_gb": "none",
+        "torch_version": "unknown",
+        "cuda_version": "none",
+        "slurm_job_id": os.environ.get("SLURM_JOB_ID", ""),
+        "slurm_cpus_per_task": os.environ.get("SLURM_CPUS_PER_TASK", ""),
+        "omp_num_threads": os.environ.get("OMP_NUM_THREADS", ""),
+    }
+
+    try:
+        info["hostname"] = platform.node()
+        info["platform"] = platform.platform()
+    except Exception:
+        pass
+
+    # Logical core count from the stdlib; physical count and CPU model are
+    # best-effort and OS-dependent.
+    try:
+        info["cpu_count_logical"] = os.cpu_count() or "unknown"
+    except Exception:
+        pass
+    try:
+        info["cpu_model"] = platform.processor() or "unknown"
+    except Exception:
+        pass
+
+    # psutil, if present, gives physical cores and RAM portably.
+    try:
+        import psutil
+        info["cpu_count_physical"] = psutil.cpu_count(logical=False) or "unknown"
+        info["ram_total_gb"] = round(psutil.virtual_memory().total / 1e9, 1)
+    except Exception:
+        # Fallback for RAM on Linux via /proc/meminfo.
+        try:
+            with open("/proc/meminfo") as fh:
+                for line in fh:
+                    if line.startswith("MemTotal:"):
+                        kb = float(line.split()[1])
+                        info["ram_total_gb"] = round(kb / 1e6, 1)
+                        break
+        except Exception:
+            pass
+    # Fallback for a readable CPU model on Linux via /proc/cpuinfo.
+    if info["cpu_model"] in ("", "unknown"):
+        try:
+            with open("/proc/cpuinfo") as fh:
+                for line in fh:
+                    if line.lower().startswith("model name"):
+                        info["cpu_model"] = line.split(":", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+    # GPU / torch details. Importing torch here is fine: an ESM/PepBERT run has
+    # already imported it, and for a baseline run the one extra import is cheap
+    # and still records "device=cpu, gpu=none" correctly.
+    try:
+        import torch
+        info["torch_version"] = torch.__version__
+        if torch.cuda.is_available():
+            info["device"] = "cuda"
+            info["gpu_count"] = torch.cuda.device_count()
+            info["gpu_name"] = torch.cuda.get_device_name(0)
+            info["cuda_version"] = torch.version.cuda or "none"
+            try:
+                props = torch.cuda.get_device_properties(0)
+                info["gpu_mem_gb"] = round(props.total_memory / 1e9, 1)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    _HARDWARE_INFO = info
+    return info
 
 
 def representation_tag(representation, foundation_model_name):
@@ -128,6 +233,71 @@ def save_results(df, df_all_pred, out_dir):
         df_all_pred.to_csv(all_pred_save_path, mode="a", header=False, index=False)
     else:
         df_all_pred.to_csv(all_pred_save_path, index=False)
+
+
+def save_timing(row, out_dir):
+    """Append one wall-clock timing record for a single run.
+
+    Written next to the run's results (same per-run folder) as ``timing.csv``,
+    so the timing aggregates the same way as the rest of the outputs. ``row`` is
+    a dict with the run metadata and the measured seconds. This answers the
+    reviewer's computational-cost question: how long one run (embedding + GPR
+    tuning/fit + selection) takes at each training size.
+    """
+    dataset = row["Dataset"]
+    seed = row["Seed"]
+    tag = row["Representation Tag"]
+    train_size = row["Train Size"]
+    folder = os.path.join(out_dir, dataset, f"{tag}", f"seed_{seed}", f"train_size_{train_size}")
+    os.makedirs(folder, exist_ok=True)
+
+    df = pd.DataFrame([{k: v for k, v in row.items() if k != "Representation Tag"}])
+    path = os.path.join(folder, "timing.csv")
+    if os.path.exists(path):
+        # A headerless append must line up with the existing columns. If an
+        # earlier timing.csv was written with a different set of columns (e.g.
+        # from an older code version), align the new row to that header so the
+        # columns never shift. Missing fields become empty.
+        try:
+            existing_cols = list(pd.read_csv(path, nrows=0).columns)
+            df = df.reindex(columns=existing_cols)
+        except Exception:
+            pass
+        df.to_csv(path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
+
+
+def save_split_sequences(sim, dataset_name, representation, tag, size, seed, out_dir):
+    """Save the exact train/test sequence partition for one benchmark run.
+
+    Writes ``split_sequences.csv`` into the run's own folder, listing every
+    training and test sequence with its score and a ``split`` label. The test
+    sequences also appear in ``simulation_all_predictions.csv`` (with
+    predictions), but the training subsample is not otherwise recorded; saving
+    both here means the full partition behind every (dataset, representation,
+    seed, train size) run can be recovered for later sequence-level analysis
+    without re-running anything.
+    """
+    rows = []
+    for s in getattr(sim, "training_sequences", []):
+        rows.append({"sequence": s, "score": sim.seq_to_score.get(s), "split": "train"})
+    for s in getattr(sim, "test_sequences", []):
+        rows.append({"sequence": s, "score": sim.seq_to_score.get(s), "split": "test"})
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df["Dataset"] = dataset_name
+    df["Representation"] = representation
+    df["Train Size"] = size
+    df["Seed"] = seed
+    folder = os.path.join(out_dir, dataset_name, f"{tag}", f"seed_{seed}", f"train_size_{size}")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "split_sequences.csv")
+    if os.path.exists(path):
+        df.to_csv(path, mode="a", header=False, index=False)
+    else:
+        df.to_csv(path, index=False)
 
 
 def run_simulations(
@@ -243,12 +413,41 @@ def run_simulations(
                 sim.initialize_test_set(levenshtein_split=levenshtein_split)
                 sim.initialize_training_set()
 
-                # Run optimization
+                # Save the exact train/test sequence partition for this run, so
+                # any later sequence-level analysis needs no re-run.
+                save_split_sequences(sim, dataset_name, representation, tag,
+                                     size, seed, out_dir)
+
+                # Run optimization. Timed end-to-end so we can report the
+                # wall-clock cost per training size (embedding + GPR tuning/fit
+                # + prediction) for the computational-cost discussion.
+                t0 = time.monotonic()
                 results_df_per_label, all_predictions_per_label = sim.optimize_all_models(
                     random_seed=seed,
                     n_trials=n_trials,
                     folds=folds,
                     optuna_print=False
+                )
+                elapsed = time.monotonic() - t0
+
+                timing_row = {
+                    "Dataset": dataset_name,
+                    "Representation": representation,
+                    "Representation Tag": tag,
+                    "Foundation": foundation_model_name if representation == "esm" else "none",
+                    "Train Size": size,
+                    "Test Size": test_sizes,
+                    "Seed": seed,
+                    "n_trials": n_trials,
+                    "folds": folds,
+                    "seconds": round(elapsed, 3),
+                }
+                # Attach the machine description (device, CPU, GPU, RAM, SLURM
+                # allocation) so the timing is interpretable across hardware.
+                timing_row.update(hardware_info())
+                save_timing(
+                    timing_row,
+                    out_dir,
                 )
 
                 # Results for this (dataset, size, seed) run only, so each run

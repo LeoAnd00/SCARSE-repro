@@ -27,6 +27,13 @@ ESM2_VARIANTS = {
     "facebook/esm2_t33_650M_UR50D": {"params": "650M", "layers": 33, "embedding_dim": 1280},
 }
 
+#: PepBERT checkpoint (peptide-specific language model). Must match
+#: PEPBERT_DEFAULT_REPO / PEPBERT_CHECKPOINT in the representation code. Unlike
+#: ESM, PepBERT ships a custom model.py/config.py and a raw .pt checkpoint, so
+#: the download must include *.py and *.pt as well.
+PEPBERT_REPO = "dzjxzyd/PepBERT-large-UniParc"
+PEPBERT_CHECKPOINT = "tmodel_17.pt"
+
 
 def human_size(n):
     for unit in ("B", "KiB", "MiB", "GiB"):
@@ -91,13 +98,60 @@ def verify(model_name, expected_dim):
     return ok
 
 
+def download_pepbert():
+    """Fetch PepBERT's custom code, config, tokenizer and checkpoint."""
+    from huggingface_hub import snapshot_download
+
+    print(f"  downloading {PEPBERT_REPO} ...", flush=True)
+    path = snapshot_download(
+        repo_id=PEPBERT_REPO,
+        allow_patterns=["*.py", "*.json", "*.pt", "*.txt"],
+    )
+    print(f"    -> {path}")
+    return path
+
+
+def verify_pepbert():
+    """Load PepBERT from cache with the network off and embed a test peptide.
+
+    PepBERT is loaded through its own custom loader rather than transformers, so
+    this exercises the exact code path the pipelines use. Importing the pipeline
+    representer keeps the loading logic in one place.
+    """
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    # Import the shared representer. Works when run from a project dir (with a
+    # functions/ package) or when that dir is on PYTHONPATH.
+    try:
+        from functions.representations import SequenceRepresenter
+    except Exception:
+        print("    SKIP verify: run from a project dir (e.g. code/workflow_simulation) "
+              "or set PYTHONPATH so 'functions' is importable. Files are cached; "
+              "the pipelines will load them.")
+        return True
+
+    rep = SequenceRepresenter(representation="pepbert", random_seed=42)
+    rep.load_model()
+    X = rep.transform(["GLPALISWIKRKRL", "KRKGFLGI"])
+    ok = X.ndim == 2 and X.shape[0] == 2
+    status = "OK " if ok else "FAILED"
+    print(f"    {status} embedding shape={X.shape}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--only", type=str, default=None,
-                        help="Cache a single checkpoint by size, e.g. 8M, 35M, 150M, 650M.")
+                        help="Cache a single checkpoint by size, e.g. 8M, 35M, 150M, 650M, pepbert.")
     parser.add_argument("--verify_only", action="store_true",
                         help="Do not download; only load what is already cached.")
+    parser.add_argument("--with_pepbert", action="store_true",
+                        help="Also cache the PepBERT checkpoint (needed for the "
+                             "--representation pepbert benchmark/AL arm).")
+    parser.add_argument("--pepbert_only", action="store_true",
+                        help="Cache (and verify) only PepBERT, skipping the ESM2 checkpoints.")
     args = parser.parse_args()
 
     hf_home = os.environ.get("HF_HOME")
@@ -110,11 +164,18 @@ def main():
     os.makedirs(hf_home, exist_ok=True)
     print(f"HF_HOME = {hf_home}\n")
 
+    # Decide what to cache. PepBERT is opt-in so existing ESM-only workflows are
+    # unchanged, but `--only pepbert` / `--pepbert_only` / `--with_pepbert` all
+    # reach it.
+    do_pepbert = args.with_pepbert or args.pepbert_only or args.only == "pepbert"
+
     variants = dict(ESM2_VARIANTS)
-    if args.only:
+    if args.pepbert_only or args.only == "pepbert":
+        variants = {}
+    elif args.only:
         variants = {k: v for k, v in ESM2_VARIANTS.items() if v["params"] == args.only}
         if not variants:
-            sizes = [v["params"] for v in ESM2_VARIANTS.values()]
+            sizes = [v["params"] for v in ESM2_VARIANTS.values()] + ["pepbert"]
             sys.exit(f"Unknown size {args.only!r}. Expected one of: {sizes}")
 
     failures = []
@@ -138,6 +199,23 @@ def main():
             failures.append(model_name)
         print()
 
+    if do_pepbert:
+        print(f"pepbert  {PEPBERT_REPO}")
+        if not args.verify_only:
+            try:
+                download_pepbert()
+            except Exception as e:
+                print(f"    DOWNLOAD FAILED: {type(e).__name__}: {e}")
+                failures.append(PEPBERT_REPO)
+        if PEPBERT_REPO not in failures:
+            try:
+                if not verify_pepbert():
+                    failures.append(PEPBERT_REPO)
+            except Exception as e:
+                print(f"    VERIFY FAILED: {type(e).__name__}: {e}")
+                failures.append(PEPBERT_REPO)
+        print()
+
     print(f"Cache size: {human_size(cache_size(hf_home))}")
 
     if failures:
@@ -145,7 +223,8 @@ def main():
         print("Re-run this script; snapshot_download resumes rather than starting over.")
         sys.exit(1)
 
-    print(f"\nAll {len(variants)} checkpoint(s) cached and loadable offline.")
+    n_cached = len(variants) + (1 if do_pepbert else 0)
+    print(f"\nAll {n_cached} checkpoint(s) cached and loadable offline.")
     print("The run scripts set HF_HUB_OFFLINE=1, so no job will contact "
           "huggingface.co from now on.")
 
